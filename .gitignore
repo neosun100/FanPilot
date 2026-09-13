@@ -8,3 +8,6 @@ research/tf
 build/
 DerivedData/
 .DS_Store
+src/fanctl
+src/fanpilotd
+state/
