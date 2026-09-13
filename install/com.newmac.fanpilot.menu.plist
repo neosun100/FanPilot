@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.newmac.fanpilot.menu</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Applications/FanPilot.app/Contents/MacOS/FanPilot</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- ⚠️ 与守护不同：菜单栏 App **不用** KeepAlive。
+       它只是显示层，挂了不影响风扇控制（守护是独立的 root LaunchDaemon）。
+       给显示层加 KeepAlive 只会在它反复崩溃时刷屏日志，掩盖真问题。
+       ⭐ 判据：KeepAlive 是给「挂了就有安全后果」的东西用的，不是给所有东西用的。 -->
+  <key>KeepAlive</key>
+  <false/>
+
+  <key>ProcessType</key>
+  <string>Interactive</string>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/fanpilot-menu.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/fanpilot-menu.log</string>
+</dict>
+</plist>

@@ -21,6 +21,7 @@ struct FanInfo: Decodable {
     let target_rpm: Double
     let min: Double
     let max: Double
+    let fault: Bool?          // 守护检测到的风扇故障（旧版状态文件没有此字段）
 }
 
 struct ConfigInfo: Decodable {
@@ -85,35 +86,68 @@ final class Controller: NSObject, NSApplicationDelegate {
     /// ⭐ 正解是绕开 AppKit 的文本基线布局：**自己渲染成 NSImage，在图像内做精确居中**。
     ///   像素级可控；且 `isTemplate = true` 让 AppKit 按浅色/深色菜单栏自动着色，
     ///   连主题适配都免了（若画成彩色位图反而要自己监听外观变化重绘）。
-    private func twoLineImage(_ top: String, _ bottom: String, dim: Bool) -> NSImage {
+    /// 菜单栏的显示状态。用枚举而不是散落的 bool —— 避免出现「既紧急又陈旧」这类
+    /// 自相矛盾的组合，也让每个状态的视觉表达只在一处定义。
+    enum Vis { case normal, emergency, fault, firmware, stale }
+
+    private func twoLineImage(_ top: String, _ bottom: String, _ vis: Vis) -> NSImage {
         let h = NSStatusBar.system.thickness          // 实测本机 22pt
-        // ⭐ 字号由「两行必须装进 h」反推，不能拍脑袋：
-        //    9pt 字体行高约 11pt ⇒ 两行 23pt > 22pt，块本身装不下，
-        //    溢出只能往上顶 —— 这才是「靠上对齐」的真因（不是偏移没调对）。
+        // ⭐ 字号由「两行必须装进 h」反推：9pt 行高约 11pt ⇒ 两行 23pt > 22pt 装不下，
+        //    溢出只能往上顶 —— 那才是早先「靠上对齐」的真因。
         let fontSize: CGFloat = 8
         let font = NSFont.monospacedDigitSystemFont(ofSize: fontSize, weight: .medium)
-        let attrs: [NSAttributedString.Key: Any] = [.font: font,
-                                                    .foregroundColor: NSColor.black]
+        let ink = NSColor.black
+        let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: ink]
         let sTop = NSAttributedString(string: top, attributes: attrs)
         let sBot = NSAttributedString(string: bottom, attributes: attrs)
 
-        let wTop = ceil(sTop.size().width), wBot = ceil(sBot.size().width)
-        let w = max(wTop, wBot) + 2
-        // 用**字形实际视觉高度**（ascender+|descender|）而不是 size().height
-        // —— 后者含 leading（行间预留），两行叠加会凭空多出 2~3pt。
+        // 🩸 固定宽度：否则 "57°C"(24pt) → "57°C 🔥"(38pt) 会让菜单栏左侧所有图标
+        //    跟着横跳；温度 2 位/3 位数也会跳。用最宽的现实内容算一次，之后恒定。
+        let ref = NSAttributedString(string: "100°C", attributes: attrs)
+        let refRPM = NSAttributedString(string: "5777", attributes: attrs)
+        let markerW: CGFloat = 5                       // 左侧状态标记预留
+        let textW = ceil(max(ref.size().width, refRPM.size().width))
+        let w = textW + markerW + 2
+
         let glyphH = ceil(font.ascender - font.descender)
         let gap: CGFloat = 0
-        let blockH = glyphH * 2 + gap
-        let pad = max(0, (h - blockH) / 2)             // 装不下时退化为 0，不出现负偏移
+        let pad = max(0, (h - glyphH * 2 - gap) / 2)
+        let wTop = ceil(sTop.size().width), wBot = ceil(sBot.size().width)
 
         let img = NSImage(size: NSSize(width: w, height: h))
         img.lockFocus()
-        // 非翻转坐标系：y 从底部起算，所以下行在下、上行在上
+        // 右对齐（等宽数字 + 右对齐 = 视觉最稳）
         sBot.draw(at: NSPoint(x: w - wBot - 1, y: pad))
         sTop.draw(at: NSPoint(x: w - wTop - 1, y: pad + glyphH + gap))
+
+        // 🩸 状态标记**不能用 emoji**：isTemplate=true 时 AppKit 丢掉颜色、
+        //    只用 alpha 当遮罩 ⇒ 🔥 变成一坨纯黑块（已用模板着色模拟实测确证）。
+        //    改成自己画的几何标记，单色下依然清晰。
+        switch vis {
+        case .emergency:
+            // 实心竖条 + 顶部缺口，单色下像个感叹号，且宽度不变
+            ink.setFill()
+            NSRect(x: 1, y: pad + 2, width: 3, height: h - pad * 2 - 6).fill()
+            NSRect(x: 1, y: pad, width: 3, height: 2).fill()
+        case .fault:
+            // 扁而宽的实心三角（警告号）——垂直居中。
+            // 早先做成 5pt宽×20pt高，单色下看着像「尖刺」而不是三角，与紧急态的
+            // 实心竖条不易区分。压扁后形状特征明确。
+            let cy = h / 2
+            let tri = NSBezierPath()
+            tri.move(to: NSPoint(x: 2.5, y: cy + 3.5))
+            tri.line(to: NSPoint(x: 0.0, y: cy - 3.0))
+            tri.line(to: NSPoint(x: 5.0, y: cy - 3.0))
+            tri.close()
+            ink.setFill(); tri.fill()
+        case .normal, .firmware, .stale:
+            break
+        }
         img.unlockFocus()
         img.isTemplate = true
-        if dim {
+
+        if vis == .firmware || vis == .stale {
+            // 非受控状态用半透明表达（模板着色仍生效）
             let dimmed = NSImage(size: img.size)
             dimmed.lockFocus()
             img.draw(at: .zero, from: .zero, operation: .sourceOver, fraction: 0.45)
@@ -125,36 +159,43 @@ final class Controller: NSObject, NSApplicationDelegate {
     }
 
     /// 供 --render-preview 用：拿到与菜单栏完全相同的那张图
-    func previewImage(_ top: String, _ bottom: String) -> NSImage {
-        twoLineImage(top, bottom, dim: false)
+    func previewImage(_ top: String, _ bottom: String, _ vis: Vis = .normal) -> NSImage {
+        twoLineImage(top, bottom, vis)
     }
 
-    private func setTitle(_ top: String, _ bottom: String, dim: Bool) {
+    private func setTitle(_ top: String, _ bottom: String, _ vis: Vis) {
         guard let b = item.button else { return }
-        b.image = twoLineImage(top, bottom, dim: dim)
+        b.image = twoLineImage(top, bottom, vis)
         b.imagePosition = .imageOnly
         b.title = ""
     }
 
     private func refresh() {
         guard let s = readStatus() else {
-            setTitle("FanPilot", "守护未运行", dim: true)
+            setTitle("--°C", "停", .stale)
             buildMenu(nil)
             return
         }
+        // 显示两风扇实际转速的**平均**。因为守护给两个风扇下的是同一个目标，
+        // 平均值天然是故障指示器：一个风扇停转 ⇒ 平均腰斩（2000 → 1000）一眼可见。
+        // （若两风扇目标各异，平均就会掩盖故障 —— 那时才必须改成别的口径。）
         let avgRPM = s.fans.map(\.actual_rpm).reduce(0, +) / Double(max(s.fans.count, 1))
         let temp = String(format: "%.0f°C", s.temp_hottest_c)
         let rpm  = String(format: "%.0f", avgRPM)
 
+        let anyFault = s.fans.contains { $0.fault == true }
         if !s.isFresh {
             // 陈旧就要说出来，绝不静默展示旧值
-            setTitle("\(temp) ⚠️", "陈旧", dim: true)
-        } else if s.mode == "emergency" {
-            setTitle("\(temp) 🔥", rpm, dim: false)
+            setTitle(temp, "陈旧", .stale)
         } else if s.mode.hasPrefix("failsafe") || s.mode.hasPrefix("stopped") {
-            setTitle("\(temp) ⚠️", "固件控", dim: true)
+            setTitle(temp, "固件", .firmware)
+        } else if anyFault {
+            // 故障优先于紧急显示：紧急是"该干的活"，故障是"硬件不对"
+            setTitle(temp, rpm, .fault)
+        } else if s.mode == "emergency" {
+            setTitle(temp, rpm, .emergency)
         } else {
-            setTitle(temp, rpm, dim: false)
+            setTitle(temp, rpm, .normal)
         }
         buildMenu(s)
     }
@@ -202,8 +243,9 @@ final class Controller: NSObject, NSApplicationDelegate {
 
         for f in s.fans {
             add(m, String(format: "风扇 %d", f.id), enabled: false)
-            add(m, String(format: "实际 %.0f RPM  ·  目标 %.0f RPM",
-                          f.actual_rpm, f.target_rpm), enabled: false, indent: 1)
+            add(m, String(format: "实际 %.0f RPM  ·  目标 %.0f RPM%@",
+                          f.actual_rpm, f.target_rpm,
+                          f.fault == true ? "   ⚠️ 疑似故障" : ""), enabled: false, indent: 1)
             add(m, String(format: "硬件范围 %.0f ~ %.0f RPM", f.min, f.max),
                 enabled: false, indent: 1)
         }
@@ -248,8 +290,25 @@ final class Controller: NSObject, NSApplicationDelegate {
 if let i = CommandLine.arguments.firstIndex(of: "--render-preview"),
    i + 1 < CommandLine.arguments.count {
     let out = CommandLine.arguments[i + 1]
+    let a = CommandLine.arguments
+    let topStr = (i + 2 < a.count) ? a[i + 2] : "57°C"
+    let botStr = (i + 3 < a.count) ? a[i + 3] : "2384"
+    let visArg = (i + 4 < a.count) ? a[i + 4] : "normal"
+    let vis: Controller.Vis
+    switch visArg {
+    case "emergency": vis = .emergency
+    case "fault":     vis = .fault
+    case "firmware":  vis = .firmware
+    case "stale":     vis = .stale
+    default:          vis = .normal
+    }
     let ctrl = Controller()
-    let img = ctrl.previewImage("57°C", "2384")
+    let img = ctrl.previewImage(topStr, botStr, vis)
+    // 诊断：报告位图的真实像素尺寸 vs 点尺寸 —— 判断是否被以 1x 渲染（Retina 会糊）
+    for r in img.representations {
+        FileHandle.standardError.write(
+          "  rep: \(r.pixelsWide)x\(r.pixelsHigh)px  声明 \(r.size)pt\n".data(using: .utf8)!)
+    }
     let h = NSStatusBar.system.thickness
     // 放大 6 倍 + 画出状态栏上下边界，肉眼/程序都能判断是否居中
     let scale: CGFloat = 6
@@ -270,6 +329,26 @@ if let i = CommandLine.arguments.firstIndex(of: "--render-preview"),
     img.draw(in: NSRect(origin: .zero, size: canvas.size),
              from: .zero, operation: .sourceOver, fraction: 1.0)
     canvas.unlockFocus()
+
+    // ⭐ 模拟 isTemplate=true 的真实效果：AppKit **丢掉颜色**，只用 alpha 当遮罩着色。
+    //    不模拟这一步的预览是有盲区的 —— 彩色 emoji 在预览里好看，
+    //    在真实菜单栏里会变成纯色剪影。判据必须复现真实渲染路径。
+    let tmpl = NSImage(size: canvas.size)
+    tmpl.lockFocus()
+    NSColor.white.setFill()
+    NSRect(origin: .zero, size: canvas.size).fill()
+    NSColor.black.set()
+    let r = NSRect(origin: .zero, size: canvas.size)
+    r.fill(using: .sourceOver)
+    // 用图像 alpha 反向擦出形状（destinationIn 保留 alpha 交集）
+    img.draw(in: r, from: .zero, operation: .destinationIn, fraction: 1.0)
+    tmpl.unlockFocus()
+    let tmplOut = out.replacingOccurrences(of: ".png", with: "-template.png")
+    if let t = tmpl.tiffRepresentation, let rp = NSBitmapImageRep(data: t),
+       let pg = rp.representation(using: .png, properties: [:]) {
+        try? pg.write(to: URL(fileURLWithPath: tmplOut))
+        print("模板着色模拟 → \(tmplOut)")
+    }
     if let tiff = canvas.tiffRepresentation,
        let rep = NSBitmapImageRep(data: tiff),
        let png = rep.representation(using: .png, properties: [:]) {

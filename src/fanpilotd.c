@@ -169,6 +169,46 @@ static double g_cur_target[NFAN];                            // 已限幅的当�
 static double g_last_written[NFAN] = {-1,-1};                 // 死区比较基准
 static long   g_writes = 0;
 
+// ── 风扇故障检测
+//
+// 为什么放在守护里而不是显示层：只有守护有**历史**，能区分
+// 「刚提速还没跟上」（正常，实测爬升需 6~9s）和「持续跟不上」（故障）。
+// 显示层只有瞬时值，无论怎么算都判不了这件事。
+//
+// 菜单栏显示的是两风扇实际转速的**平均**。因为守护给两个风扇下的是**同一个目标**，
+// 平均值天然就是故障指示器：一个风扇停转 ⇒ 平均直接腰斩（2000 → 1000）。
+// ⚠️ 但那依赖人眼注意到数字变小，所以这里再加一层机器判据。
+static int    g_fault[NFAN]     = {0,0};   // 已判定为故障
+static int    g_fault_cnt[NFAN] = {0,0};   // 连续异常次数
+static double g_settle_at[NFAN] = {0,0};   // 目标上调后的"允许爬升"截止时刻
+static double g_prev_target[NFAN] = {0,0}; // 上一周期的目标（判断是否上调）
+
+#define FAULT_RATIO   0.55   // 实际低于目标的这个比例即算异常
+#define FAULT_CYCLES  6      // 连续这么多周期才判故障（2s 轮询 ⇒ 12s）
+#define SPINUP_GRACE  12.0   // 目标上调后给多少秒爬升宽限（实测 0→2500 约 6~9s）
+
+// 返回 1 = 该风扇处于故障态
+static int fault_check(int f, double target, double actual, double now){
+    // 目标很低时不判（接近 0 转本来就可能是固件在管）
+    if (target < 1000 || actual < 0) { g_fault_cnt[f] = 0; g_fault[f] = 0; return 0; }
+    if (now < g_settle_at[f]) return g_fault[f];        // 还在爬升宽限期内
+    if (actual < target * FAULT_RATIO) {
+        if (g_fault_cnt[f] < 1000) g_fault_cnt[f]++;
+        if (g_fault_cnt[f] >= FAULT_CYCLES && !g_fault[f]) {
+            g_fault[f] = 1;
+            // 降级必须留痕：说清是"检测到"而不是"我猜"
+            fprintf(stderr, "⚠️ 风扇 %d 疑似故障：目标 %.0f RPM，实际仅 %.0f RPM，"
+                            "已连续 %d 个周期低于 %.0f%%\n",
+                    f, target, actual, g_fault_cnt[f], FAULT_RATIO * 100);
+        }
+    } else {
+        if (g_fault[f]) fprintf(stderr, "✅ 风扇 %d 恢复正常（%.0f/%.0f RPM）\n",
+                                f, actual, target);
+        g_fault_cnt[f] = 0; g_fault[f] = 0;
+    }
+    return g_fault[f];
+}
+
 // 枚举 Tp* 簇（启动时一次）
 static int enum_sensors(void){
     Key nk; if (key_init(&nk, "#KEY") != 0) return -1;
@@ -306,7 +346,7 @@ static void cfg_load(const char *path){
 }
 
 static void write_status(const char *path, double hot, double ema,
-                        double ac[], double tg[], const char *mode){
+                        double ac[], double tg[], const char *mode, const int fault[]){
     char tmp[512]; snprintf(tmp, sizeof tmp, "%s.tmp", path);
     FILE *fp = fopen(tmp, "w");
     if (!fp) return;
@@ -325,8 +365,9 @@ static void write_status(const char *path, double hot, double ema,
       cfg.ema_seconds, cfg.slew_up, cfg.slew_down, cfg.deadband);
     for (int f = 0; f < NFAN; f++)
         fprintf(fp, "    {\"id\": %d, \"actual_rpm\": %.0f, \"target_rpm\": %.0f,"
-                    " \"min\": %.0f, \"max\": %.0f}%s\n",
-                f, ac[f], tg[f], g_fmin[f], g_fmax[f], f==NFAN-1?"":",");
+                    " \"min\": %.0f, \"max\": %.0f, \"fault\": %s}%s\n",
+                f, ac[f], tg[f], g_fmin[f], g_fmax[f],
+                (fault && fault[f]) ? "true" : "false", f==NFAN-1?"":",");
     fprintf(fp, "  ]\n}\n");
     fclose(fp);
     rename(tmp, path);                    // 原子替换，读者永远看不到半个文件
@@ -440,7 +481,8 @@ int main(int argc, char **argv){
             fprintf(stderr, "⚠️ 传感器读取失败 → 交还固件自动控制\n");
             fans_to_firmware();
             double z[NFAN] = {0,0};
-            write_status(status_path, -1, -1, z, z, "failsafe_sensor_read_failed");
+            int nofault[NFAN] = {0,0};
+            write_status(status_path, -1, -1, z, z, "failsafe_sensor_read_failed", nofault);
             sleep(5);
             continue;
         }
@@ -485,10 +527,16 @@ int main(int argc, char **argv){
             }
             if (key_read_flt(&g_ac[f], &ac[f]) != 0) ac[f] = -1;
             tg[f] = target;
+
+            // 目标明显上调 ⇒ 给硬件爬升宽限，别把「正在加速」误判成故障
+            double nowt = (double)time(NULL);
+            if (target > g_prev_target[f] + 100) g_settle_at[f] = nowt + SPINUP_GRACE;
+            g_prev_target[f] = target;
+            fault_check(f, target, ac[f], nowt);
         }
 
         write_status(status_path, hot, g_ema, ac, tg,
-                     emergency ? "emergency" : "normal");
+                     emergency ? "emergency" : "normal", g_fault);
         if (oneshot) break;
         usleep((useconds_t)(cfg.poll_interval * 1e6));
     }
@@ -497,7 +545,8 @@ int main(int argc, char **argv){
     fprintf(stderr, "收到退出信号 → 交还固件自动控制\n");
     fans_to_firmware();
     double z[NFAN] = {0,0};
-    write_status(status_path, -1, -1, z, z, "stopped_firmware_auto");
+    int nf2[NFAN] = {0,0};
+    write_status(status_path, -1, -1, z, z, "stopped_firmware_auto", nf2);
     if (g_conn) IOServiceClose(g_conn);
     return 0;
 }
