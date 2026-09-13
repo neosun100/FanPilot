@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.newmac.fanpilotd</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/sbin/fanpilotd</string>
+    <string>--config</string>
+    <string>/usr/local/etc/fanpilot.conf</string>
+    <string>--status</string>
+    <string>/var/run/fanpilot.status.json</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- ⚠️ KeepAlive 不是可选项，它是失效安全机制本身（见 docs/PLAN.md §4.1）：
+       SIGKILL / 崩溃 / 内核 panic 时进程内的清理代码不会执行，而 SMC 实测
+       **不会自动回退**（停写 60s 后仍保持手动）。唯一的兜底就是 launchd
+       在 ~1s 内把守护拉回来、由新实例重新接管。
+       verify.sh 有断言钉住这一条，不许改成 false。 -->
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ThrottleInterval</key>
+  <integer>1</integer>
+
+  <key>StandardOutPath</key>
+  <string>/var/log/fanpilotd.log</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/fanpilotd.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+</dict>
+</plist>

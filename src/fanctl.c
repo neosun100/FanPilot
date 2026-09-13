@@ -160,6 +160,33 @@ static void print_status(void){
     printf("  ⇒ 最热 %.2f °C\n", hot);
 }
 
+// 机器可读输出（纯 ASCII，key=value）。
+//
+// 🩸 为什么必须有这个：verify.sh 初版去解析上面 print_status() 的中文输出，
+//    结果 macOS 自带的 BSD awk **不是多字节安全的** —— `$i=="目标"` 对几乎每个
+//    字段都返回真，2 个风扇被数成 12 个，判据坏掉却看起来像真失败。
+//    ⭐ 通则：给人看的输出和给程序读的输出必须分开；
+//       别拿中文字面量当解析键（macOS awk 上尤其）。
+static void print_kv(void){
+    int ok; int n = read_u8("FNum", &ok);
+    printf("fan_count=%d\n", ok ? n : -1);
+    for (int f = 0; f < (ok ? n : 2); f++) {
+        char kac[5], ktg[5], kmd[5];
+        snprintf(kac,5,"F%dAc",f); snprintf(ktg,5,"F%dTg",f); snprintf(kmd,5,"F%dmd",f);
+        double mn, mx; fan_bounds(f, &mn, &mx);
+        int o;
+        printf("fan%d_actual=%.0f\n", f, read_flt(kac,&o));
+        printf("fan%d_target=%.0f\n", f, read_flt(ktg,&o));
+        printf("fan%d_mode=%d\n",     f, read_u8(kmd,&o));
+        printf("fan%d_min=%.0f\n",    f, mn);
+        printf("fan%d_max=%.0f\n",    f, mx);
+    }
+    const char *tk[] = {"Tp00","Tp0C","Tp0X","TCMb","TVDP",NULL};
+    double hot = -999;
+    for (int i = 0; tk[i]; i++) { int o; double v = read_flt(tk[i], &o); if (o && v > hot) hot = v; }
+    printf("temp_hottest=%.2f\n", hot);
+}
+
 static int cmd_archive(const char *path){
     FILE *fp = fopen(path, "w");
     if (!fp) { perror("fopen"); return 1; }
@@ -213,6 +240,7 @@ int main(int argc, char **argv){
     const char *c = argv[1];
 
     if (!strcmp(c, "status"))       print_status();
+    else if (!strcmp(c, "kv"))      print_kv();
     else if (!strcmp(c, "archive") && argc == 3) rc = cmd_archive(argv[2]);
     else if (!strcmp(c, "auto"))    rc = cmd_auto();
     else if (!strcmp(c, "rpm") && argc == 4)  rc = cmd_rpm(atoi(argv[2]), atof(argv[3]));

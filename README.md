@@ -61,14 +61,37 @@ FanPilotHelper（root LaunchDaemon）
 
 ## 现状
 
+**Phase 0 + Phase 1 已完成，验收 18/18 通过。**
+
 - [x] SMC 可行性验证（`research/smcprobe.c`）
 - [x] 传感器普查与响应性判定（`research/sensors.c` `research/sample.c`）
+- [x] 开销基准：2s 轮询 CPU **0.100%**（`research/bench.c`）
 - [x] 参照实现架构逆向（`Macs Fan Control` 走 SMJobBless）
-- [ ] 写入路径验证（需 root 授权，会改动当前风扇设置）
-- [ ] helper + XPC
-- [ ] 曲线引擎
-- [ ] 菜单栏 UI
-- [ ] 看门狗与失效安全
+- [x] **Phase 0** 写入路径验证：值域校验、写入生效、两风扇可控、还原
+- [x] **Phase 1** `fanpilotd` 守护：五层控制链 + 单实例锁 + 失效安全
+- [x] install / verify / uninstall（照 NewMac `cpu-limiter` 规程）
+- [ ] **Phase 2** 菜单栏 App（温度+转速显示、曲线编辑）
+- [ ] Phase 3 迁出 Macs Fan Control、进 NewMac profile 与哨兵清册
+
+## 快速开始
+
+```bash
+make            # 编译守护与 fanctl
+make install    # 装成 root LaunchDaemon（KeepAlive）
+make verify     # 18 项验收，含 4 条反向断言
+make status     # 看当前温度/转速
+make uninstall  # 卸载（会先交还固件）
+```
+
+## 实测效果
+
+| 场景 | 表现 |
+|---|---|
+| 空载 43°C | 稳定 2000 RPM（下限） |
+| 加载至 61°C | 平滑爬升 2142 → 3051 RPM，无过冲振荡 |
+| 停载 | 按降速限幅缓慢回落至 2000（约 40s） |
+| `kill -9` | launchd **1 秒内**拉回，风扇**全程未低于 2000** |
+| 资源 | CPU **0.100%** · RSS 5.66 MB · 亚2ms定时器 **0/s** · 唤醒 0.66/s |
 
 ## 研究工具（全部只读）
 
