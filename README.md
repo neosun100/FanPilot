@@ -11,7 +11,7 @@
 
 <p align="center">
   <img alt="platform" src="https://img.shields.io/badge/macOS-13%2B%20·%20Apple%20Silicon-0F4C75"/>
-  <img alt="tests" src="https://img.shields.io/badge/tests-132%20passing-3AAFA9"/>
+  <img alt="tests" src="https://img.shields.io/badge/tests-133%20passing-3AAFA9"/>
   <img alt="license" src="https://img.shields.io/badge/license-MIT-blue"/>
 </p>
 
@@ -37,32 +37,169 @@ FanPilot 接管这件事：读 CPU 核心温度，按一条曲线连续调节两
 
 ---
 
-## 快速开始
+## 安装
+
+> **要求**：Apple Silicon Mac · macOS 13+ · 与其它风扇控制软件**互斥**（两者会抢写 SMC）
+
+### 第 0 步：先做兼容性预检（只读，什么都不改）
+
+FanPilot 依赖 SMC 的 `F*Tg` 键可写、`FNum` 可读、`Tp*` 传感器存在。这些在不同机型上不一定成立，
+所以**先确认你的机器支不支持，再装东西**——不要先装一个 root 守护、然后才发现不兼容。
+
+```bash
+tar -xzf FanPilot-1.0.0.tar.gz && cd FanPilot-1.0.0
+bash install/precheck.sh
+```
+
+输出示例（本机）：
+
+```
+── SMC 接口（决定能不能用）
+  ✅ SMC 可读（IOServiceMatching("AppleSMC") 成功）
+  ✅ 检测到 2 个风扇（FNum）
+  ✅ 风扇0: 范围 1350~5349 RPM · 当前 2014 RPM · 模式 0（0=固件 1=手动）
+  ✅ 风扇1: 范围 1350~5777 RPM · 当前 2018 RPM · 模式 0
+  ✅ 温度传感器可读（当前最热 53.7 °C）
+── 冲突检查
+  ✅ 无其它风扇控制软件
+  ✅ 完全兼容，可以安装
+```
+
+有 ❌ 阻断项就**不要装**。预检完全只读，不会改动任何东西。
+
+### 方式 A：用安装包（推荐）
+
+从 [Releases](https://github.com/neosun100/FanPilot/releases/latest) 下载 `FanPilot-1.0.0.tar.gz`：
+
+```bash
+tar -xzf FanPilot-1.0.0.tar.gz
+cd FanPilot-1.0.0
+bash install.sh
+```
+
+`install.sh` 会依次做 5 件事，每步都会打印结果：
+
+| 步骤 | 做什么 | 要 sudo？ |
+|---|---|:--:|
+| 1 | 解除 Gatekeeper 隔离（见下方说明） | ❌ |
+| 2 | 跑兼容性预检 + 冲突检查，**有阻断项就中止** | ❌ |
+| 3 | 装控制守护 `fanpilotd`（root LaunchDaemon） | ✅ |
+| 4 | 装菜单栏 App 到 `/Applications` + 开机自启 | ❌ |
+| 5 | 跑 25 项验收，全绿才算成功 | ✅ |
+
+> **为什么要 sudo**：写 SMC 风扇寄存器需要 root（读不需要）。守护是**全机唯一**能写 SMC 的进程；
+> 菜单栏 App 完全无特权，只读状态文件。这个权限边界是刻意划的，见[架构](#架构)。
+
+> **关于 Gatekeeper**：包内二进制是 **ad-hoc 签名**（自用工具，没有 Apple Developer ID）。
+> 从网上下载的文件带 `com.apple.quarantine` 属性，Gatekeeper 会拒绝执行。
+> `install.sh` 第一步执行 `xattr -dr com.apple.quarantine` 解除——
+> 这不是绕过安全机制，而是你对自己下载的东西做**显式授信**。
+> 介意的话请走方式 B 从源码编译。
+
+### 方式 B：从源码编译
+
+不想信任预编译二进制就自己编。需要 **Xcode Command Line Tools**（`xcode-select --install`）：
 
 ```bash
 git clone https://github.com/neosun100/FanPilot.git
 cd FanPilot
 
-make                 # 编译守护与 fanctl
+make                 # 编译守护 fanpilotd 与命令行工具 fanctl（C，无第三方依赖）
+make precheck        # 兼容性预检（只读）
 make install         # 装 root LaunchDaemon（会要 sudo）
 make verify          # 25 项验收，含反向断言
 
-cd app && swift build -c release && ./bundle.sh && cd ..
-bash install/install-app.sh   # 装菜单栏 App + 开机自启（不需要 sudo）
+make app                        # 编译菜单栏 App（需要 Swift 6+）
+bash install/install-app.sh     # 装 App + 开机自启（不需要 sudo）
 ```
 
-卸载：`make uninstall`（**会先把风扇交还固件再删文件**，顺序反了会把风扇永久留在手动模式）。
+跑一遍全部测试（可选，133 项）：`make test`
+
+### 装了什么、装在哪
+
+装 root 守护这种事应该完全透明：
+
+| 路径 | 内容 | 谁的 |
+|---|---|---|
+| `/usr/local/sbin/fanpilotd` | 控制守护（约 80 KB，纯 C） | root |
+| `/Library/LaunchDaemons/com.newmac.fanpilotd.plist` | 守护的 launchd 配置（`RunAtLoad` + `KeepAlive`） | root |
+| `/usr/local/etc/fanpilot/fanpilot.conf` | 配置（`key = value`，带注释） | **你**（App 要能改） |
+| `/var/run/fanpilot.status.json` | 运行状态（守护写，`0644`） | root 写 / 所有人可读 |
+| `/var/log/fanpilotd.log` | 守护日志 | root |
+| `/Applications/FanPilot.app` | 菜单栏 App（约 300 KB） | 你 |
+| `~/Library/LaunchAgents/com.newmac.fanpilot.menu.plist` | App 的开机自启 | 你 |
+
+不装任何内核扩展、不改 SIP、不装第三方依赖、不联网。
+
+### 确认装好了
+
+```bash
+cat /var/run/fanpilot.status.json      # 应看到实时温度与两个风扇的目标/实际转速
+sudo launchctl print system/com.newmac.fanpilotd | grep -E 'state|runs'
+```
+
+`state = running` 且 `runs = 1` 就对了。**`runs` 短时间暴涨说明守护在崩溃重启循环**（`KeepAlive` 在反复救它），
+这时看 `/var/log/fanpilotd.log`。
+
+菜单栏右侧应出现两行小字：上行温度、下行转速。
+
+### 卸载
+
+```bash
+sudo bash install/uninstall.sh    # 守护
+# App：
+launchctl bootout gui/$(id -u)/com.newmac.fanpilot.menu
+rm -f ~/Library/LaunchAgents/com.newmac.fanpilot.menu.plist
+rm -rf /Applications/FanPilot.app
+```
+
+> 卸载脚本**先让守护把风扇交还固件，再删文件**。顺序反了会把风扇永久留在手动模式
+> ——实测 SMC **不会**自动回退（停止写入 60 秒后仍保持手动）。脚本里还有一道无条件兜底，
+> 即使守护的信号处理没跑成也会强制写回 `F*md=0`。
+
+### 常见问题
+
+**菜单栏没出现图标？**
+App 是 `LSUIElement`（不进 Dock），只在菜单栏。若菜单栏项太多可能被折叠——
+先确认进程在跑：`pgrep -x FanPilot`。日志在 `/tmp/fanpilot-menu.log`。
+
+**显示「守护未运行」？**
+`sudo launchctl print system/com.newmac.fanpilotd` 看状态，`/var/log/fanpilotd.log` 看原因。
+最常见是**有其它风扇软件在抢写 SMC**——安装时会检测并拒绝，但如果是装完之后才装的其它软件就不会被拦。
+
+**改转速下限报 Permission denied？**
+配置属主被改成了 root。修：`sudo chown $(whoami) /usr/local/etc/fanpilot/fanpilot.conf`
+（原子写需要**目录**也可写，所以配置放在专属目录 `/usr/local/etc/fanpilot/` 下）。
+
+**风扇一直不转 / 转速是 0？**
+先跑预检确认 `F*Tg` 可写。若守护 `mode` 显示 `stopped_firmware_auto`，
+说明它已交还固件——固件在凉的时候本来就让风扇停转（本机实测 68.8 °C 时仍是 0 转）。
 
 ---
 
-## 菜单栏
+## 使用
 
-菜单栏显示两行：上行最热核心温度、下行两个风扇的平均转速。
+<p align="center">
+  <img src="assets/menubar-states.png" alt="菜单栏四种状态" width="100%"/>
+</p>
 
-固定宽度 23pt，四种状态（正常 / 紧急 / 风扇故障 / 固件接管）宽度一致，**不会横跳挤占其他图标**。
-状态标记用自绘几何图形而非 emoji——模板着色模式下 emoji 会变成纯黑块。
+菜单栏两行：上行最热核心温度、下行两个风扇的平均转速。
 
-下拉面板里可以调**转速下限**（6 档）。改完即刻生效，不需要编辑配置文件、也不需要输密码。
+固定宽度 23pt，四种状态宽度一致，**不会横跳挤占其他图标**。状态标记是**贴底细条**而不是 emoji：
+
+- **正常** —— 无标记
+- **紧急全速** —— 贴底实心条（温度 ≥ 90 °C，忽略限幅直接打满）
+- **风扇故障** —— 贴底虚线条（实际转速持续低于目标 55%）
+- **固件接管** —— 整体变淡（守护已退出，风扇回到出厂控制）
+
+> 为什么不用 emoji：模板着色模式下 AppKit 只用 alpha 通道，🔥 会变成一坨纯黑块。
+> 为什么标记贴底而不放左侧：4 位转速（如 `5349`）占满全宽时，左侧标记会压在数字上。
+
+点开下拉面板可以看到：当前模式、最热与平滑后温度、每个风扇的实际/目标/硬件范围/故障标记、
+生效中的全部参数、累计 SMC 写入次数，以及两个开关——**转速下限**（6 档）和**开机自动启动**。
+
+改完下限**即刻生效**：守护监视配置文件 mtime 自动重载，不需要编辑配置文件、不需要输密码、
+也不需要点什么"重新加载"。
 
 > 下限只决定**空闲时的地板转速**，不改变高温时的散热能力——曲线永远铺到硬件上限。
 > 真实的取舍是「空闲噪音 ↔ 温度基线」。
@@ -120,14 +257,14 @@ bash install/install-app.sh   # 装菜单栏 App + 开机自启（不需要 sudo
 ## 测试
 
 ```bash
-make test     # 单元 81 + 验收 25 + E2E/回归 26 = 132 项
+make test     # 单元 81 + 验收 25 + E2E/回归 27 = 133 项
 ```
 
 | 层 | 内容 |
 |---|---|
 | `tests/unit_logic.c` | **81 项** —— `fanlogic.h` 全部纯逻辑：正常路径 + 边界 + 退化输入（0 / 负 / 除零 / NaN） |
 | `install/verify.sh` | **25 项** —— 运行状态、失效安全断言、资源预算、反向断言 |
-| `tests/e2e.sh` | **26 项** —— 完整用户路径 + **10 条按真实 bug 编号的回归**（R1~R10） |
+| `tests/e2e.sh` | **27 项** —— 完整用户路径 + **10 条按真实 bug 编号的回归**（R1~R10） |
 
 纯决策逻辑全部剥离到 `src/fanlogic.h`（零 IOKit 依赖），否则它与 IOKit 缠在一起时**只能靠跑真机观察，无法单元测试**。
 

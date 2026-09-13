@@ -5,7 +5,7 @@ LDFLAGS := -framework IOKit -framework CoreFoundation
 SRC      := src
 RESEARCH := research
 
-.PHONY: all daemon tools research install verify uninstall status clean test unit e2e app dist
+.PHONY: all daemon tools research install verify uninstall status clean test unit e2e app dist precheck
 
 all: daemon tools
 
@@ -23,7 +23,10 @@ research: $(RESEARCH)/smcprobe $(RESEARCH)/sensors $(RESEARCH)/sample $(RESEARCH
 $(RESEARCH)/%: $(RESEARCH)/%.c
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
 
-install: all
+precheck: tools
+	@bash install/precheck.sh
+
+install: all precheck
 	sudo bash install/install.sh
 
 verify:

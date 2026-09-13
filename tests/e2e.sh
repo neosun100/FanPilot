@@ -176,6 +176,31 @@ if [ -x "${APPBIN}" ]; then
   w1="$(printf '%s\n' ${ws} | head -1)"
   awk -v w="${w1}" 'BEGIN{exit !(w<=26)}' && ok "宽度 ${w1}pt ≤ 26pt（未回退到 34/38pt 的臃肿版）" \
                                           || bad "宽度 ${w1}pt 过宽，挤占菜单栏"
+  # 🩸 状态标记不得与数字重叠（实测踩过：4 位转速占满全宽时，
+  #    画在左侧空隙的标记直接压在数字上，数字读不出来）。
+  #    判据：用**最宽内容**渲染紧急态，检查文字墨迹与贴底标记条之间必须有空行。
+  "${APPBIN}" --render-preview /tmp/e2e-collide.png "100°" "5777" emergency >/dev/null 2>&1
+  if [ -f /tmp/e2e-collide.png ] && command -v uv >/dev/null 2>&1; then
+    gap="$(uv run --with pillow --no-project python -c "
+from PIL import Image
+im=Image.open('/tmp/e2e-collide.png').convert('L'); W,H=im.size; px=im.load()
+# 只看文字区（跳过左侧）与整宽区，找出有墨迹的行
+rows=[y for y in range(H) if sum(1 for x in range(W) if px[x,y]<128) > 0]
+if not rows: print(-1); raise SystemExit
+# 贴底标记条 = 最底部连续的整宽墨迹带；文字在其上方
+bot=max(rows)
+band=bot
+while band-1 in rows: band-=1
+text=[y for y in rows if y < band]
+print((band-max(text)-1) if text else -1)
+" 2>/dev/null)"
+    if [ "${gap:-0}" -ge 1 ] 2>/dev/null; then
+      ok "状态标记与数字之间有 ${gap}px 空隙（最宽内容 100°/5777 下不重叠）"
+    else
+      bad "状态标记与数字重叠（间隙 ${gap:-?}）" "4 位转速时标记会压在数字上"
+    fi
+  fi
+
   # emoji 不得出现在菜单栏渲染路径（模板模式会变纯黑块）
   em="$(grep -cE 'setTitle\([^)]*[🔥⚠️]' "${ROOT}/app/Sources/FanPilotMenu/main.swift" || true)"
   [ "${em}" = "0" ] && ok "菜单栏渲染路径无 emoji（模板模式下会变黑块）" \

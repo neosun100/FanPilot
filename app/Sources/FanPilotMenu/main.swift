@@ -211,7 +211,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let glyphH = ceil(font.ascender - font.descender)
         let gap: CGFloat = 0
-        let pad = max(0, (h - glyphH * 2 - gap) / 2)
+        let pad = max(2, (h - glyphH * 2 - gap) / 2 + 1)   // +1 给贴底标记条让位
         let wTop = ceil(sTop.size().width), wBot = ceil(sBot.size().width)
 
         let img = NSImage(size: NSSize(width: w, height: h))
@@ -220,26 +220,27 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         sBot.draw(at: NSPoint(x: w - wBot - 1, y: pad))
         sTop.draw(at: NSPoint(x: w - wTop - 1, y: pad + glyphH + gap))
 
-        // 🩸 状态标记**不能用 emoji**：isTemplate=true 时 AppKit 丢掉颜色、
-        //    只用 alpha 当遮罩 ⇒ 🔥 变成一坨纯黑块（已用模板着色模拟实测确证）。
-        //    改成自己画的几何标记，单色下依然清晰。
+        // 🩸 状态标记的两条约束，都是实测踩出来的：
+        //   ① **不能用 emoji**：isTemplate=true 时 AppKit 丢掉颜色、只用 alpha 当遮罩
+        //      ⇒ 🔥 变成一坨纯黑块（已用模板着色模拟确证）
+        //   ② **不能画在左侧空隙里**：初版靠"文字右对齐天然留左空隙"来放标记，
+        //      但下限是 4 位数时（5349 / 1247）文字占满全宽、左边没有空隙，
+        //      标记直接压在数字上，数字读不出来。
+        //      而加一个专用标记列又要多占 ~5pt 宽度（菜单栏是稀缺空间）。
+        // ⇒ 正解：画成**贴底的整宽细条**。零宽度成本，且位于文字下沿之外，
+        //   物理上不可能与任何文字重叠。
         switch vis {
         case .emergency:
-            // 实心竖条 + 顶部缺口，单色下像个感叹号，且宽度不变
+            // 实心整宽条 = 最强提示
             ink.setFill()
-            NSRect(x: 0, y: pad + 2, width: 2.5, height: h - pad * 2 - 6).fill()
-            NSRect(x: 0, y: pad, width: 2.5, height: 2).fill()
+            NSRect(x: 0, y: 0, width: w, height: 2).fill()
         case .fault:
-            // 扁而宽的实心三角（警告号）——垂直居中。
-            // 早先做成 5pt宽×20pt高，单色下看着像「尖刺」而不是三角，与紧急态的
-            // 实心竖条不易区分。压扁后形状特征明确。
-            let cy = h / 2
-            let tri = NSBezierPath()
-            tri.move(to: NSPoint(x: 2.0, y: cy + 3.5))
-            tri.line(to: NSPoint(x: 0.0, y: cy - 3.0))
-            tri.line(to: NSPoint(x: 4.0, y: cy - 3.0))
-            tri.close()
-            ink.setFill(); tri.fill()
+            // 虚线整宽条（3 段）= 与紧急态一眼可分，且同样不占宽度
+            ink.setFill()
+            let seg = (w - 4) / 3
+            for k in 0..<3 {
+                NSRect(x: CGFloat(k) * (seg + 2), y: 0, width: seg, height: 2).fill()
+            }
         case .normal, .firmware, .stale:
             break
         }

@@ -30,37 +30,15 @@ xattr -dr com.apple.quarantine "${HERE}" 2>/dev/null || true
 echo "  ✅ 已解除"
 
 echo
-echo "=== 2. 检查是否有其他风扇控制软件在抢写 SMC ==="
-# 🩸 不用 `ps | grep <名字>` 做检测。经典的 `[m]acsfancontrol` 括号技巧只能防止 grep
-#    匹配**自己**的命令行；一旦这段脚本的文本本身出现在 ps 输出里（例如被内联进
-#    `bash -c` 执行），它就会匹配到自己，**四个软件全部误报**（实测踩过）。
-# ⇒ 改成两条不依赖"我的文本不出现在 ps 里"的判据：
-#    ① `pgrep -x` 按**精确进程名**匹配（不看完整命令行）
-#    ② 直接查已知的安装路径是否存在
-CONFLICT=0
-for proc in "Macs Fan Control" smcFanControl TGPro "iStat Menus"; do
-  if pgrep -x "${proc}" >/dev/null 2>&1; then
-    echo "  ⚠️  检测到正在运行：${proc}"; CONFLICT=1
-  fi
-done
-for path in "/Applications/Macs Fan Control.app" \
-            "/Applications/smcFanControl.app" \
-            "/Applications/TG Pro.app" \
-            /Library/PrivilegedHelperTools/com.crystalidea.macsfancontrol.smcwrite; do
-  if [ -e "${path}" ]; then
-    echo "  ⚠️  检测到已安装：${path}"; CONFLICT=1
-  fi
-done
-if [ "${CONFLICT}" = "1" ]; then
+echo "=== 2. 兼容性预检（只读，含冲突检查）==="
+# ⭐ 预检必须在装任何东西**之前** —— 不能让用户先装一个 root 守护再发现不兼容。
+if ! bash "${HERE}/install/precheck.sh"; then
   echo
-  echo "  🔴 两个程序同时写 SMC 会互相抢，转速会乱跳且不报错。"
-  echo "     请先完全退出并卸载其它风扇控制软件，再运行本安装。"
+  echo "  🔴 预检有阻断项，安装中止。上面已列出原因。"
   exit 2
 fi
-echo "  ✅ 无冲突"
-
 echo
-echo "=== 3. 安装控制守护（需要 sudo）==="
+echo "=== 3. 安装控制守护（需要 sudo：它是 root LaunchDaemon）==="
 sudo bash "${HERE}/install/install.sh"
 
 echo
