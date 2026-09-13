@@ -1,16 +1,20 @@
-# 编译产物
-research/smcprobe
-research/sensors
-research/sample
-research/tf
-*.o
 .build/
+.DS_Store
+*.dSYM/
+*.o
+# 编译产物
+app/.build/
+app/FanPilot.app/
 build/
 DerivedData/
-.DS_Store
+dist/*.tar.gz
+dist/FanPilot-*
+research/bench
+research/sample
+research/sensors
+research/smcprobe
+research/tf
 src/fanctl
 src/fanpilotd
 state/
-app/.build/
-app/FanPilot.app/
 tests/unit_logic

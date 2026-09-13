@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="FanPilot">
+  <title>FanPilot</title>
+  <defs>
+    <!-- 蓝→青：表达「降温」这个目的，而不是「发热」这个问题 -->
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%"   style="stop-color:#0F4C75"/>
+      <stop offset="100%" style="stop-color:#3AAFA9"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="512" height="512" rx="96" fill="url(#bg)"/>
+
+  <!-- 三叶风扇。叶片不透明度递增(0.62→0.80→0.96) ——
+       这个渐变本身就在表达「转速随温度爬升」，
+       所以不需要再画一条温度曲线（多一个图形只会让小尺寸糊掉）。
+       叶型比初版更肥更短：细长叶片在小尺寸下退化成毛刺。 -->
+  <g transform="translate(256 256)">
+    <path d="M0 -152 C60 -132 88 -75 63 -33 C42 2 4 6 -13 -13 C-32 -46 -29 -110 0 -152 Z"
+          fill="#fff" opacity="0.62"/>
+    <path d="M0 -152 C60 -132 88 -75 63 -33 C42 2 4 6 -13 -13 C-32 -46 -29 -110 0 -152 Z"
+          fill="#fff" opacity="0.80" transform="rotate(120)"/>
+    <path d="M0 -152 C60 -132 88 -75 63 -33 C42 2 4 6 -13 -13 C-32 -46 -29 -110 0 -152 Z"
+          fill="#fff" opacity="0.96" transform="rotate(240)"/>
+    <!-- 轮毂：实心白点 + 略小的深色内点。半径取得比叶尾内缘更大，
+         否则叶尾会把内点切成三角形（初版就是这么坏的）。 -->
+    <circle r="44" fill="#fff"/>
+    <circle r="16" fill="#0F4C75" opacity="0.9"/>
+  </g>
+</svg>

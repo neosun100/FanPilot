@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="FanPilot mark">
+  <title>FanPilot mark</title>
+  <!-- 小尺寸专用版。三轮迭代后的结论：
+       ① 无背景、单色（fill=currentColor）⇒ 深浅背景通用，也可当模板图着色
+       ② 叶片必须**更肥更短**：细长叶片在 16px 下退化成毛刺
+       ③ 轮毂用**实心点**，不用圆环 ——
+          初版做成 evenodd 挖空的圆环，三片叶尾把环切开，渲染出来像个三角形；
+          且圆环在 16px 下必然糊死。实心点在任何尺寸都成立。
+       ④ 叶片与轮毂之间留 6px 空气，避免小尺寸下粘成一坨 -->
+  <g transform="translate(256 256)" fill="currentColor">
+    <g>
+      <path d="M0 -158 C62 -138 92 -78 66 -34 C44 2 4 6 -14 -14 C-34 -48 -30 -114 0 -158 Z"/>
+      <path d="M0 -158 C62 -138 92 -78 66 -34 C44 2 4 6 -14 -14 C-34 -48 -30 -114 0 -158 Z"
+            transform="rotate(120)"/>
+      <path d="M0 -158 C62 -138 92 -78 66 -34 C44 2 4 6 -14 -14 C-34 -48 -30 -114 0 -158 Z"
+            transform="rotate(240)"/>
+    </g>
+    <circle r="46" fill="currentColor"/>
+  </g>
+</svg>

@@ -1,103 +1,172 @@
-# FanPilot
+<p align="center">
+  <img src="assets/logo.svg" width="120" height="120" alt="FanPilot"/>
+</p>
 
-**macOS 菜单栏风扇自适应温控工具**，用于替换 `Macs Fan Control`。
+<h1 align="center">FanPilot</h1>
 
-目标：**装上就不用管** —— 按温度自动调速，配置面尽可能小。
+<p align="center">
+  <b>macOS 菜单栏风扇自适应温控</b><br/>
+  按温度自动调速，装上就不用管。
+</p>
 
-> 机器：MacBook Pro M5 Max (Mac17,6) · macOS 26.6.2
-> 📌 技术调研与全部实测数据：**[`docs/SMC-RESEARCH.md`](docs/SMC-RESEARCH.md)**
-
----
-
-## 为什么自研
-
-| 动机 | 说明 |
-|---|---|
-| **自适应** | Macs Fan Control 当前是**固定转速**模式（本机被钉在 3400 RPM，而硬件上限 5349/5777）⇒ 风扇无法随负载升速，散热被人为封顶 |
-| **少一个第三方 root 组件** | 它装了常驻 root helper `com.crystalidea.macsfancontrol.smcwrite` 持续写 SMC |
-| **配置面可控** | 我们只需要一条曲线，不需要预设管理/许可证/更新检查 |
-
-⚠️ **本项目不解决 2026-09-13 的两次 SoC 看门狗重启。**
-那是固件层故障（`iBoot panic` / `wdog`），与风扇控制无因果关系。
-证据见 `NewMac/docs/runbooks/assets/panic-2026-09-13/`。
+<p align="center">
+  <img alt="platform" src="https://img.shields.io/badge/macOS-13%2B%20·%20Apple%20Silicon-0F4C75"/>
+  <img alt="tests" src="https://img.shields.io/badge/tests-132%20passing-3AAFA9"/>
+  <img alt="license" src="https://img.shields.io/badge/license-MIT-blue"/>
+</p>
 
 ---
 
-## 可行性：已实测确证
+## 这是什么
 
-| 项 | 结果 |
+macOS 不让你控制风扇转速。机器凉的时候风扇完全停转，热起来才由固件接管——而固件的启动阈值很高（本机实测 **68.8 °C 时风扇仍是 0 转**）。
+
+FanPilot 接管这件事：读 CPU 核心温度，按一条曲线连续调节两个风扇，并保证一个**转速下限**（默认 2000 RPM），让机器始终有气流。
+
+它的设计目标不是"散热最强"，而是**恰到好处且永不失控**：
+
+| | |
 |---|---|
-| IOKit 访问 SMC（M5 Max / SIP on） | ✅ 可用，无需 kext |
-| 读传感器 | ✅ **免 root** |
-| 写风扇 | 需 **root**（SIP 无需关闭） |
-| 风扇数 | 2（`FNum=2`） |
-| 控制面 | **仅 4 个键**：`F0md` `F1md` `F0Tg` `F1Tg` |
-| 转速范围 | 风扇0 **1350~5349** · 风扇1 **1350~5777**（上限不同！） |
-| 控制输入 | `Tp0*` 性能核簇最大值（实测最灵敏 `Tp00`，极差 10.77 °C） |
+| **自适应** | 23 个核心温度传感器取最大值 → 五层平滑 → 连续调速，无阶跃、无抖动 |
+| **可控** | 菜单栏里点一下改转速下限，曲线自动跟着重新铺开 |
+| **省资源** | 守护常驻 **CPU 0.10%** · RSS 5.7 MB · 亚 2ms 定时器 **0/s** |
+| **失效安全** | 任何异常都回到出厂的「固件自动控制」，绝不把风扇留在低速 |
+
+> ⚠️ 本工具直接写 SMC 风扇寄存器。所有目标值都被夹在硬件自己报告的 `F*Mn`~`F*Mx` 范围内，
+> 且 90 °C 以上强制打满且忽略一切用户配置。但你仍应了解自己在做什么。
+
+---
+
+## 快速开始
+
+```bash
+git clone https://github.com/neosun100/FanPilot.git
+cd FanPilot
+
+make                 # 编译守护与 fanctl
+make install         # 装 root LaunchDaemon（会要 sudo）
+make verify          # 25 项验收，含反向断言
+
+cd app && swift build -c release && ./bundle.sh && cd ..
+bash install/install-app.sh   # 装菜单栏 App + 开机自启（不需要 sudo）
+```
+
+卸载：`make uninstall`（**会先把风扇交还固件再删文件**，顺序反了会把风扇永久留在手动模式）。
+
+---
+
+## 菜单栏
+
+菜单栏显示两行：上行最热核心温度、下行两个风扇的平均转速。
+
+固定宽度 23pt，四种状态（正常 / 紧急 / 风扇故障 / 固件接管）宽度一致，**不会横跳挤占其他图标**。
+状态标记用自绘几何图形而非 emoji——模板着色模式下 emoji 会变成纯黑块。
+
+下拉面板里可以调**转速下限**（6 档）。改完即刻生效，不需要编辑配置文件、也不需要输密码。
+
+> 下限只决定**空闲时的地板转速**，不改变高温时的散热能力——曲线永远铺到硬件上限。
+> 真实的取舍是「空闲噪音 ↔ 温度基线」。
 
 ---
 
 ## 架构
 
+<p align="center">
+  <img src="assets/architecture.svg" alt="FanPilot 架构" width="100%"/>
+</p>
+
+两层按权限隔离，数据单向流动：
+
+- **`fanpilotd`**（root LaunchDaemon，C）—— 全机唯一能写 SMC 的进程。`flock` 单实例锁，`KeepAlive` 兜底。
+- **`FanPilot.app`**（菜单栏，Swift/AppKit）—— **无任何权限**，只读状态 JSON，绝不碰 SMC。
+
+配置文件对用户可写（否则无特权的 App 改不了设置），因此**配置被当作不可信输入**：所有安全阈值在守护代码里硬夹，不相信文件里写的值。
+
+### 五层控制链
+
 ```
-FanPilot.app（菜单栏 · 无权限）
-  ├ SensorReader   IOKit 只读，免 root
-  ├ CurveEngine    温度 → 目标 RPM（分段线性 + 滞回）
-  └ HelperClient   XPC → helper
-          │  {key, value}
-FanPilotHelper（root LaunchDaemon）
-  └ 唯一职责：SMCWriteKey，带白名单 + 值域校验 + 看门狗
+23×Tp* → max() → EMA(15s) → 分段曲线 → 非对称限幅 → 死区(50 RPM) → 写 SMC
+         局部热点   瞬时尖峰    温度→转速    升200/降60      抑制无谓写入
 ```
 
-### 安全红线（helper 侧强制，不信任调用方）
+每层解决一个具体的抖动来源。**非对称限幅是"丝滑"的关键**：散热要快（升 200 RPM/s）、安静要稳（降 60 RPM/s）。
 
-1. **键白名单** —— 只有那 4 个键可写，其余拒绝
-2. **值域校验** —— 目标 RPM 必须在运行时读到的 `F*Mn`~`F*Mx` 内
-3. **看门狗** —— App 异常退出后自动把 `F*md` 写回 `0`，**交还固件自动控制**
-   > 这条是最重要的失效安全：绝不能把风扇留在"手动低速"。
-   > 本机现在的处境正是这个反面教材。
+### 曲线自适应
+
+配置里的曲线是**形状模板**。抬高下限时整条曲线按 `[下限, 硬件上限]` 重新铺开，而不是被夹平：
+
+| 下限 | 45 °C | 55 °C | 65 °C | 75 °C | 85 °C |
+|---:|---:|---:|---:|---:|---:|
+| 2000 | 2000 | 2609 | 3421 | 4334 | 5349 |
+| 3000 | 3000 | 3427 | 3997 | 4637 | 5349 |
+| 4000 | 4000 | 4245 | 4572 | 4940 | 5349 |
+
+两个风扇的硬件上限不同（实测 5349 / 5777 RPM），曲线**按各自上限分别重铺**。
+
+### 失效安全
+
+| 场景 | 机制 | 暴露窗口 |
+|---|---|---|
+| 正常退出 / `SIGTERM` / 卸载 | 信号处理器写 `F*md=0` 交还固件 | 0 |
+| `SIGKILL` / 崩溃 / 内核 panic | launchd `KeepAlive` 重启，新实例接管 | ~1 s |
+| 传感器读取失败 | 立即交还固件，不用陈旧值继续控制 | 0 |
+
+实测确认 **SMC 不会自动回退**（停止写入 60 秒后仍保持手动模式），所以 `KeepAlive` 不是可选项而是安全机制本身。
+
+⭐ 转速下限本身也是失效安全：守护死掉时风扇保持最后转速，最坏情况是**卡在 ≥2000 RPM**——比出厂固件空闲时的 0 转风量还大，失效方向偏安全。
 
 ---
 
-## 现状
-
-**Phase 0 + Phase 1 已完成，验收 18/18 通过。**
-
-- [x] SMC 可行性验证（`research/smcprobe.c`）
-- [x] 传感器普查与响应性判定（`research/sensors.c` `research/sample.c`）
-- [x] 开销基准：2s 轮询 CPU **0.100%**（`research/bench.c`）
-- [x] 参照实现架构逆向（`Macs Fan Control` 走 SMJobBless）
-- [x] **Phase 0** 写入路径验证：值域校验、写入生效、两风扇可控、还原
-- [x] **Phase 1** `fanpilotd` 守护：五层控制链 + 单实例锁 + 失效安全
-- [x] install / verify / uninstall（照 NewMac `cpu-limiter` 规程）
-- [ ] **Phase 2** 菜单栏 App（温度+转速显示、曲线编辑）
-- [ ] Phase 3 迁出 Macs Fan Control、进 NewMac profile 与哨兵清册
-
-## 快速开始
+## 测试
 
 ```bash
-make            # 编译守护与 fanctl
-make install    # 装成 root LaunchDaemon（KeepAlive）
-make verify     # 18 项验收，含 4 条反向断言
-make status     # 看当前温度/转速
-make uninstall  # 卸载（会先交还固件）
+make test     # 单元 81 + 验收 25 + E2E/回归 26 = 132 项
 ```
 
-## 实测效果
-
-| 场景 | 表现 |
+| 层 | 内容 |
 |---|---|
-| 空载 43°C | 稳定 2000 RPM（下限） |
-| 加载至 61°C | 平滑爬升 2142 → 3051 RPM，无过冲振荡 |
-| 停载 | 按降速限幅缓慢回落至 2000（约 40s） |
-| `kill -9` | launchd **1 秒内**拉回，风扇**全程未低于 2000** |
-| 资源 | CPU **0.100%** · RSS 5.66 MB · 亚2ms定时器 **0/s** · 唤醒 0.66/s |
+| `tests/unit_logic.c` | **81 项** —— `fanlogic.h` 全部纯逻辑：正常路径 + 边界 + 退化输入（0 / 负 / 除零 / NaN） |
+| `install/verify.sh` | **25 项** —— 运行状态、失效安全断言、资源预算、反向断言 |
+| `tests/e2e.sh` | **26 项** —— 完整用户路径 + **10 条按真实 bug 编号的回归**（R1~R10） |
 
-## 研究工具（全部只读）
+纯决策逻辑全部剥离到 `src/fanlogic.h`（零 IOKit 依赖），否则它与 IOKit 缠在一起时**只能靠跑真机观察，无法单元测试**。
+
+**反向断言和正向断言一样重要**——只验"能用"会漏掉"不该能用的也能用"。例如：越界转速必须被拒、第二个实例必须启动失败、恶意配置的安全阈值必须被夹住。
+
+---
+
+## 文档
+
+| | |
+|---|---|
+| [`docs/SMC-RESEARCH.md`](docs/SMC-RESEARCH.md) | SMC 逆向调研：键位、可写性判定、传感器筛选方法、全部实测数据 |
+| [`docs/PLAN.md`](docs/PLAN.md) | 设计与开发计划：控制算法、安全红线、资源预算、被推翻的设计 |
+
+调研工具（全部只读，不写任何 SMC 键）：
 
 ```bash
-cd research
-clang -O2 -framework IOKit -framework CoreFoundation -o smcprobe smcprobe.c && ./smcprobe
-clang -O2 -framework IOKit -framework CoreFoundation -o sensors  sensors.c  && ./sensors
-clang -O2 -framework IOKit -framework CoreFoundation -o sample   sample.c   && ./sample 70 2
+make research
+./research/smcprobe    # 枚举全部 3669 个 SMC 键 + 风扇现状
+./research/sensors     # 传感器普查 + 可写性属性
+./research/sample 70 2 # 时序采样（判传感器响应性用）
+./research/bench       # 读取开销基准
 ```
+
+> 🩸 **传感器必须按「时序方差」筛，不能按瞬时值筛。** 按数值排最热的两个键是 `Tf06`=88.81 °C 与
+> `Tf16`=85.97 °C，看着像热点告警——实测 70 秒 35 个样本**标准差 0.000**，它们是常量
+> （很可能是固件跳闸点），不是实时温度。判据是方差，不是瞬时值。
+
+---
+
+## 兼容性
+
+在 **MacBook Pro M5 Max (Mac17,6) / macOS 26.6.2 / SIP 启用**上开发与实测。
+
+不硬编码任何机型参数：风扇数量取自 `FNum`，上下限取自 `F*Mn`/`F*Mx`，传感器在启动时枚举。
+理论上适用于有可写 `F*Tg` 键的 Apple Silicon Mac，但**只在上述机型验证过**。
+
+---
+
+## 许可
+
+MIT
