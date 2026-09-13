@@ -39,6 +39,6 @@ echo "=== 3. 删除文件 ==="
 rm -f "${PLIST}" "${BIN}" "${STATUS}"
 echo "  ✅ 已删 ${PLIST}"
 echo "  ✅ 已删 ${BIN}"
-echo "  ⏭  保留配置 /usr/local/etc/fanpilot.conf 与日志 /var/log/fanpilotd.log"
+echo "  ⏭  保留配置 /usr/local/etc/fanpilot/fanpilot.conf 与日志 /var/log/fanpilotd.log"
 echo
 echo "✅ 卸载完成。风扇已回到出厂固件自动控制。"

@@ -15,7 +15,8 @@ BIN_SRC="$(cd "$(dirname "$0")/.." && pwd)/src/fanpilotd"
 BIN_DST="/usr/local/sbin/fanpilotd"
 PLIST_SRC="$(cd "$(dirname "$0")" && pwd)/${LABEL}.plist"
 PLIST_DST="/Library/LaunchDaemons/${LABEL}.plist"
-CONF_DST="/usr/local/etc/fanpilot.conf"
+CONF_DIR="/usr/local/etc/fanpilot"
+CONF_DST="${CONF_DIR}/fanpilot.conf"
 STATUS="/var/run/fanpilot.status.json"
 LOG="/var/log/fanpilotd.log"
 
@@ -34,7 +35,7 @@ fi
 echo "  ✅ 无竞争者"
 
 echo "=== 2. 安装二进制与默认配置 ==="
-install -d -m 755 /usr/local/sbin /usr/local/etc
+install -d -m 755 /usr/local/sbin /usr/local/etc "${CONF_DIR}"
 install -m 755 "${BIN_SRC}" "${BIN_DST}"
 echo "  ✅ ${BIN_DST}"
 
@@ -75,8 +76,12 @@ fi
 #    文件系统信息当成用户名。（本项目已被这个坑咬过 3 次：install.sh / 两处调研脚本。）
 CONSOLE_USER="$(/usr/bin/stat -f '%Su' /dev/console 2>/dev/null || echo root)"
 if [ -n "${CONSOLE_USER}" ] && [ "${CONSOLE_USER}" != "root" ]; then
-  chown "${CONSOLE_USER}" "${CONF_DST}"
-  echo "  ✅ 配置属主 → ${CONSOLE_USER}（菜单栏 App 可编辑；安全阈值仍由守护硬夹）"
+  # 🩸 必须连**目录**一起 chown，不能只 chown 文件：
+  #    原子写（临时文件 + rename）需要在同目录创建文件，目录不可写就会
+  #    Permission denied —— 实测踩过，`sed -i` 与 App 的 replaceItemAt 都栽在这。
+  #    所以给配置一个专属目录，而不是放宽 /usr/local/etc 本身的权限。
+  chown "${CONSOLE_USER}" "${CONF_DIR}" "${CONF_DST}"
+  echo "  ✅ 配置目录+文件属主 → ${CONSOLE_USER}（菜单栏 App 可原子写；安全阈值仍由守护硬夹）"
 fi
 
 echo "=== 3. 卸载旧实例（若有）——轮询等 label 真消失（坑6）==="

@@ -32,6 +32,8 @@ struct ConfigInfo: Decodable {
     let slew_up: Double
     let slew_down: Double
     let deadband: Double
+    let emergency_temp: Double?
+    let curve_autoscale: Int?
 }
 
 struct Status: Decodable {
@@ -50,7 +52,7 @@ struct Status: Decodable {
 }
 
 let statusPath = "/var/run/fanpilot.status.json"
-let configPath = "/usr/local/etc/fanpilot.conf"
+let configPath = "/usr/local/etc/fanpilot/fanpilot.conf"
 
 func readStatus() -> Status? {
     guard let data = FileManager.default.contents(atPath: statusPath) else { return nil }
@@ -59,9 +61,20 @@ func readStatus() -> Status? {
 
 // ───────────────────────── 菜单栏 ─────────────────────────
 
-final class Controller: NSObject, NSApplicationDelegate {
+final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var item: NSStatusItem!
     private var timer: Timer?
+    /// 菜单里所有会变的行，按固定顺序持有引用 —— 刷新时**就地改 title**，
+    /// 不整体替换 menu（菜单打开时替换会打断交互）。
+    private var dyn: [NSMenuItem] = []
+    private var menuBuilt = false
+    private var floorItems: [NSMenuItem] = []
+    /// 可选下限档位（6 档）。
+    /// ⭐ 刻意**不做自由输入框**：输错一个数字就可能把机器闷住或让风扇常驻高噪，
+    ///   而这里根本不需要连续可调 —— 高温段的转速由曲线自适应接管，
+    ///   下限只决定「最安静时的地板」。给档位而不给输入框，是拿掉一整类用户错误。
+    /// 上界只到 4000：更高的**常驻**转速噪音大且无必要（真要更高，高温段会自动铺上去）。
+    static let floorChoices = [1500, 2000, 2500, 3000, 3500, 4000]
 
     func applicationDidFinishLaunching(_: Notification) {
         // .accessory = 只在菜单栏出现，不进 Dock、不抢焦点
@@ -69,10 +82,17 @@ final class Controller: NSObject, NSApplicationDelegate {
 
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.menu = NSMenu()
+        item.menu?.delegate = self
         refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+        // 🩸 必须加到 .common 模式：默认的 .default 模式在菜单打开时
+        //    （NSEventTrackingRunLoopMode 模态跟踪）**不会触发** ——
+        //    那会导致「菜单一打开，里面的数字就冻在打开那一刻」，
+        //    而且一关菜单又恢复正常，极难发现。
+        let t = Timer(timeInterval: 2.0, repeats: true) { [weak self] _ in
             self?.refresh()
         }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
     }
 
     /// 菜单栏两行显示（沿用原软件 menubarTwoLines 的习惯）：上行温度、下行转速
@@ -101,13 +121,15 @@ final class Controller: NSObject, NSApplicationDelegate {
         let sTop = NSAttributedString(string: top, attributes: attrs)
         let sBot = NSAttributedString(string: bottom, attributes: attrs)
 
-        // 🩸 固定宽度：否则 "57°C"(24pt) → "57°C 🔥"(38pt) 会让菜单栏左侧所有图标
-        //    跟着横跳；温度 2 位/3 位数也会跳。用最宽的现实内容算一次，之后恒定。
-        let ref = NSAttributedString(string: "100°C", attributes: attrs)
-        let refRPM = NSAttributedString(string: "5777", attributes: attrs)
-        let markerW: CGFloat = 5                       // 左侧状态标记预留
-        let textW = ceil(max(ref.size().width, refRPM.size().width))
-        let w = textW + markerW + 2
+        // 🩸 固定宽度（消除横跳），但宽度要**尽量窄** —— 菜单栏是稀缺空间，
+        //    我们多占一点，别人就少一点。两处收窄：
+        //    ① 参照串用 "100°" 而不是 "100°C"：省掉一个字符宽，仍明确是温度
+        //    ② **不预留独立标记列**：文字右对齐，短内容天然在左侧留出空隙，
+        //       状态标记就画在那段空隙里 ⇒ 标记不额外占宽度
+        //    实测：34pt → 见 --render-preview 输出（约 -8pt）
+        let refTemp = NSAttributedString(string: "100°", attributes: attrs)
+        let refRPM  = NSAttributedString(string: "5777", attributes: attrs)
+        let w = ceil(max(refTemp.size().width, refRPM.size().width)) + 1
 
         let glyphH = ceil(font.ascender - font.descender)
         let gap: CGFloat = 0
@@ -127,17 +149,17 @@ final class Controller: NSObject, NSApplicationDelegate {
         case .emergency:
             // 实心竖条 + 顶部缺口，单色下像个感叹号，且宽度不变
             ink.setFill()
-            NSRect(x: 1, y: pad + 2, width: 3, height: h - pad * 2 - 6).fill()
-            NSRect(x: 1, y: pad, width: 3, height: 2).fill()
+            NSRect(x: 0, y: pad + 2, width: 2.5, height: h - pad * 2 - 6).fill()
+            NSRect(x: 0, y: pad, width: 2.5, height: 2).fill()
         case .fault:
             // 扁而宽的实心三角（警告号）——垂直居中。
             // 早先做成 5pt宽×20pt高，单色下看着像「尖刺」而不是三角，与紧急态的
             // 实心竖条不易区分。压扁后形状特征明确。
             let cy = h / 2
             let tri = NSBezierPath()
-            tri.move(to: NSPoint(x: 2.5, y: cy + 3.5))
+            tri.move(to: NSPoint(x: 2.0, y: cy + 3.5))
             tri.line(to: NSPoint(x: 0.0, y: cy - 3.0))
-            tri.line(to: NSPoint(x: 5.0, y: cy - 3.0))
+            tri.line(to: NSPoint(x: 4.0, y: cy - 3.0))
             tri.close()
             ink.setFill(); tri.fill()
         case .normal, .firmware, .stale:
@@ -172,15 +194,15 @@ final class Controller: NSObject, NSApplicationDelegate {
 
     private func refresh() {
         guard let s = readStatus() else {
-            setTitle("--°C", "停", .stale)
-            buildMenu(nil)
+            setTitle("--°", "停", .stale)
+            updateMenu(nil)
             return
         }
         // 显示两风扇实际转速的**平均**。因为守护给两个风扇下的是同一个目标，
         // 平均值天然是故障指示器：一个风扇停转 ⇒ 平均腰斩（2000 → 1000）一眼可见。
         // （若两风扇目标各异，平均就会掩盖故障 —— 那时才必须改成别的口径。）
         let avgRPM = s.fans.map(\.actual_rpm).reduce(0, +) / Double(max(s.fans.count, 1))
-        let temp = String(format: "%.0f°C", s.temp_hottest_c)
+        let temp = String(format: "%.0f°", s.temp_hottest_c)   // 省一个字符宽；单位含义靠 ° 已足够
         let rpm  = String(format: "%.0f", avgRPM)
 
         let anyFault = s.fans.contains { $0.fault == true }
@@ -197,7 +219,7 @@ final class Controller: NSObject, NSApplicationDelegate {
         } else {
             setTitle(temp, rpm, .normal)
         }
-        buildMenu(s)
+        updateMenu(s)
     }
 
     private func add(_ menu: NSMenu, _ title: String,
@@ -210,75 +232,193 @@ final class Controller: NSObject, NSApplicationDelegate {
         menu.addItem(mi)
     }
 
-    private func buildMenu(_ s: Status?) {
+    /// 建一次菜单骨架。**所有会变的行都预先建好**（包括平时隐藏的告警行），
+    /// 这样刷新时索引恒定、只改 title，不增删项 —— 菜单打开时也能安全更新。
+    private func buildMenuSkeleton(fanCount: Int) {
         let m = NSMenu()
-        guard let s else {
-            add(m, "⚠️ 守护未运行", enabled: false)
-            add(m, "  sudo launchctl bootstrap system \\", enabled: false, indent: 1)
-            add(m, "    /Library/LaunchDaemons/com.newmac.fanpilotd.plist", enabled: false, indent: 1)
-            m.addItem(.separator())
-            add(m, "退出", action: #selector(quit), key: "q")
-            item.menu = m
-            return
+        m.delegate = self
+        dyn.removeAll()
+        floorItems.removeAll()
+
+        func dynItem(_ indent: Int = 0) -> NSMenuItem {
+            let mi = NSMenuItem(title: "", action: nil, keyEquivalent: "")
+            mi.isEnabled = false
+            mi.indentationLevel = indent
+            m.addItem(mi)
+            dyn.append(mi)
+            return mi
         }
 
-        let modeText: String
-        switch s.mode {
-        case "normal":    modeText = "自适应控制中"
-        case "emergency": modeText = "🔥 紧急全速（温度超阈值）"
-        default:          modeText = "⚠️ \(s.mode)"
-        }
-        add(m, modeText, enabled: false)
-        if !s.isFresh {
-            add(m, "⚠️ 状态已陈旧 \(Int(Date().timeIntervalSince1970 - s.ts)) 秒 —— 守护可能已卡住",
-                enabled: false)
-        }
+        _ = dynItem()          // 0  模式
+        _ = dynItem()          // 1  陈旧告警（平时 isHidden）
         m.addItem(.separator())
-
-        add(m, String(format: "最热核心   %.1f °C   (%d 个传感器取最大)",
-                      s.temp_hottest_c, s.sensors), enabled: false)
-        add(m, String(format: "平滑后     %.1f °C   (EMA %.0fs，控制用的就是这个)",
-                      s.temp_smoothed_c, s.config.ema_seconds), enabled: false)
+        _ = dynItem()          // 2  最热核心
+        _ = dynItem()          // 3  平滑后
         m.addItem(.separator())
-
-        for f in s.fans {
-            add(m, String(format: "风扇 %d", f.id), enabled: false)
-            add(m, String(format: "实际 %.0f RPM  ·  目标 %.0f RPM%@",
-                          f.actual_rpm, f.target_rpm,
-                          f.fault == true ? "   ⚠️ 疑似故障" : ""), enabled: false, indent: 1)
-            add(m, String(format: "硬件范围 %.0f ~ %.0f RPM", f.min, f.max),
-                enabled: false, indent: 1)
+        for _ in 0..<fanCount {
+            _ = dynItem()      // 风扇标题
+            _ = dynItem(1)     // 实际/目标(+故障)
+            _ = dynItem(1)     // 硬件范围
         }
         m.addItem(.separator())
-
-        let maxText = s.config.max_rpm > 0 ? String(format: "%.0f", s.config.max_rpm) : "硬件上限"
-        add(m, String(format: "下限 %.0f  ·  上限 %@", s.config.min_rpm, maxText), enabled: false)
-        add(m, String(format: "限幅 升%.0f / 降%.0f RPM每秒  ·  死区 %.0f",
-                      s.config.slew_up, s.config.slew_down, s.config.deadband), enabled: false)
-        add(m, String(format: "轮询 %.1fs  ·  累计写入 SMC %d 次",
-                      s.config.poll_interval, s.writes_total), enabled: false)
+        _ = dynItem()          // 下限/上限
+        _ = dynItem()          // 限幅/死区
+        _ = dynItem()          // 轮询/写入
         m.addItem(.separator())
 
-        add(m, "编辑配置…", action: #selector(openConfig))
-        add(m, "重新加载配置", action: #selector(reloadConfig))
+        // ⭐ 唯一需要用户调的东西：转速下限。
+        //    不给「编辑配置文件」和「重新加载」——让用户去编辑配置文件、再手动 reload，
+        //    本身就是设计失败。守护监视配置 mtime 自动重载，所以点一下即刻生效。
+        let floorItem = NSMenuItem(title: "转速下限", action: nil, keyEquivalent: "")
+        let floorMenu = NSMenu()
+        // 一句话掐掉最容易产生的误解（选高档 ≠ 高负载时更凉）
+        let note = NSMenuItem(title: "只影响空闲时的噪音与温度基线", action: nil, keyEquivalent: "")
+        note.isEnabled = false
+        floorMenu.addItem(note)
+        let note2 = NSMenuItem(title: "高温时一律铺到硬件上限，与此设置无关", action: nil, keyEquivalent: "")
+        note2.isEnabled = false
+        floorMenu.addItem(note2)
+        floorMenu.addItem(.separator())
+        for v in Self.floorChoices {
+            // ⭐ 标签必须描述**真实语义**：下限只决定「空闲时的地板转速」，
+            //    它**不改变高温时的散热能力** —— 曲线永远铺到硬件上限(5349/5777)。
+            //    🩸 初版把 4000 标成「强散热」是误导：会让人以为选高档能压住高负载。
+            //       真实的取舍是「空闲噪音 ↔ 温度基线」，标签就该说这个。
+            let hint: String
+            switch v {
+            case 1500: hint = "最静 · 温度基线最高"
+            case 2000: hint = "安静 · 默认"
+            case 2500: hint = "较静"
+            case 3000: hint = "均衡"
+            case 3500: hint = "偏凉 · 常有风声"
+            default:   hint = "最凉 · 风声明显"
+            }
+            let mi = NSMenuItem(title: "\(v) RPM   ·  \(hint)",
+                                action: #selector(setFloor(_:)), keyEquivalent: "")
+            mi.target = self
+            mi.tag = v
+            floorMenu.addItem(mi)
+            floorItems.append(mi)
+        }
+        floorItem.submenu = floorMenu
+        m.addItem(floorItem)
+
         m.addItem(.separator())
         add(m, "退出", action: #selector(quit), key: "q")
+
         item.menu = m
+        menuBuilt = true
     }
 
-    @objc private func openConfig() {
-        NSWorkspace.shared.open(URL(fileURLWithPath: configPath))
+    /// 就地更新（不重建）。dyn 的顺序必须与 buildMenuSkeleton 完全一致。
+    private func updateMenu(_ s: Status?) {
+        guard let s else {
+            if !menuBuilt || dyn.count < 4 { buildMenuSkeleton(fanCount: 0) }
+            if dyn.indices.contains(0) { dyn[0].title = "⚠️ 守护未运行"; dyn[0].isHidden = false }
+            for i in 1..<dyn.count { dyn[i].isHidden = true }
+            return
+        }
+        // 风扇数变了才重建骨架（正常永不发生，但别假设）
+        let need = 7 + s.fans.count * 3
+        if !menuBuilt || dyn.count != need { buildMenuSkeleton(fanCount: s.fans.count) }
+        guard dyn.count == need else { return }
+
+        var i = 0
+        func set(_ t: String, hidden: Bool = false) {
+            if dyn.indices.contains(i) { dyn[i].title = t; dyn[i].isHidden = hidden }
+            i += 1
+        }
+
+        switch s.mode {
+        case "normal":    set("自适应控制中")
+        case "emergency": set("🔥 紧急全速（温度超阈值）")
+        default:          set("⚠️ \(s.mode)")
+        }
+        let age = Int(Date().timeIntervalSince1970 - s.ts)
+        set("⚠️ 状态已陈旧 \(age) 秒 —— 守护可能已卡住", hidden: s.isFresh)
+
+        set(String(format: "最热核心   %.1f °C   (%d 个传感器取最大)",
+                   s.temp_hottest_c, s.sensors))
+        set(String(format: "平滑后     %.1f °C   (EMA %.0fs，控制用的就是这个)",
+                   s.temp_smoothed_c, s.config.ema_seconds))
+
+        for f in s.fans {
+            set(String(format: "风扇 %d", f.id))
+            set(String(format: "实际 %.0f RPM  ·  目标 %.0f RPM%@",
+                       f.actual_rpm, f.target_rpm,
+                       f.fault == true ? "   ⚠️ 疑似故障" : ""))
+            set(String(format: "硬件范围 %.0f ~ %.0f RPM", f.min, f.max))
+        }
+
+        let maxText = s.config.max_rpm > 0 ? String(format: "%.0f", s.config.max_rpm) : "硬件上限"
+        set(String(format: "下限 %.0f  ·  上限 %@", s.config.min_rpm, maxText))
+        set(String(format: "限幅 升%.0f / 降%.0f RPM每秒  ·  死区 %.0f",
+                   s.config.slew_up, s.config.slew_down, s.config.deadband))
+        set(String(format: "轮询 %.1fs  ·  累计写入 SMC %d 次",
+                   s.config.poll_interval, s.writes_total))
+
+        // 勾选当前生效的下限（读的是守护报告的**生效值**，不是我们以为写进去的值）
+        for mi in floorItems {
+            mi.state = (abs(Double(mi.tag) - s.config.min_rpm) < 1) ? .on : .off
+        }
     }
 
-    /// 热加载 = 给守护发 SIGHUP。需要 root，所以走 osascript 弹系统授权框
-    /// —— 刻意**不**内嵌特权 helper：为了少一个常驻 root 组件，
-    /// 那正是我们要替换掉 Macs Fan Control 的理由之一。
-    @objc private func reloadConfig() {
-        let script = "do shell script \"/usr/bin/killall -HUP fanpilotd\" with administrator privileges"
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        task.arguments = ["-e", script]
-        try? task.run()
+    // 菜单即将打开时立刻刷一次，避免展示上一个 tick 的旧值
+    func menuWillOpen(_ menu: NSMenu) { refresh() }
+
+    /// 改转速下限：只改配置文件里的 min_rpm 一行，守护监视 mtime 自动重载。
+    ///
+    /// 刻意**不**用 osascript 提权发 SIGHUP：那会每次弹密码框，而且为了显示层
+    /// 引入提权路径与「少一个常驻 root 组件」的初衷相悖。
+    @objc private func setFloor(_ sender: NSMenuItem) {
+        let v = sender.tag
+        guard v > 0 else { return }
+        writeConfigKey("min_rpm", String(v))
+    }
+
+    /// 就地替换配置里某个 key 的值，保留其余内容（含注释）。
+    /// 原子写：先写临时文件再 rename —— 守护随时可能在读，不能让它看到半个文件。
+    private func writeConfigKey(_ key: String, _ value: String) {
+        let url = URL(fileURLWithPath: configPath)
+        guard var text = try? String(contentsOf: url, encoding: .utf8) else {
+            notify("改配置失败", "读不到 \(configPath)")
+            return
+        }
+        var lines = text.components(separatedBy: "\n")
+        var replaced = false
+        for (i, line) in lines.enumerated() {
+            // 只匹配「行首(可空白) key (可空白) =」，避免命中注释里出现的同名词
+            let t = line.trimmingCharacters(in: .whitespaces)
+            guard t.hasPrefix(key) else { continue }
+            let after = t.dropFirst(key.count).trimmingCharacters(in: .whitespaces)
+            guard after.hasPrefix("=") else { continue }
+            // 保留行尾注释
+            let comment = line.firstIndex(of: "#").map { String(line[$0...]) } ?? ""
+            lines[i] = "\(key) = \(value)" + (comment.isEmpty ? "" : "    " + comment)
+            replaced = true
+            break
+        }
+        if !replaced { lines.append("\(key) = \(value)") }
+        text = lines.joined(separator: "\n")
+
+        let tmp = url.appendingPathExtension("tmp")
+        do {
+            try text.write(to: tmp, atomically: false, encoding: .utf8)
+            _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
+        } catch {
+            notify("改配置失败", "写不了 \(configPath)：\(error.localizedDescription)")
+            return
+        }
+        // 不弹成功提示：下一次 refresh(≤2s) 菜单里的勾选与数值会自己更新，
+        // 那就是最好的确认 —— 判「当前事实」，不判「我执行了动作」。
+    }
+
+    private func notify(_ title: String, _ body: String) {
+        let a = NSAlert()
+        a.messageText = title
+        a.informativeText = body
+        a.alertStyle = .warning
+        a.runModal()
     }
 
     @objc private func quit() { NSApp.terminate(nil) }

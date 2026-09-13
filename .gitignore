@@ -13,3 +13,4 @@ src/fanpilotd
 state/
 app/.build/
 app/FanPilot.app/
+tests/unit_logic

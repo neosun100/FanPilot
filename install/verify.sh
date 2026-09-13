@@ -11,7 +11,7 @@ set -uo pipefail
 LABEL="com.newmac.fanpilotd"
 BIN="/usr/local/sbin/fanpilotd"
 PLIST="/Library/LaunchDaemons/${LABEL}.plist"
-CONF="/usr/local/etc/fanpilot.conf"
+CONF="/usr/local/etc/fanpilot/fanpilot.conf"
 STATUS="/var/run/fanpilot.status.json"
 FANCTL="$(cd "$(dirname "$0")/.." && pwd)/src/fanctl"
 

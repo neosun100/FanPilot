@@ -9,7 +9,7 @@
   <array>
     <string>/usr/local/sbin/fanpilotd</string>
     <string>--config</string>
-    <string>/usr/local/etc/fanpilot.conf</string>
+    <string>/usr/local/etc/fanpilot/fanpilot.conf</string>
     <string>--status</string>
     <string>/var/run/fanpilot.status.json</string>
   </array>
