@@ -12,7 +12,10 @@ all: daemon tools
 daemon: $(SRC)/fanpilotd
 tools:  $(SRC)/fanctl
 
-$(SRC)/fanpilotd: $(SRC)/fanpilotd.c
+# 🩸 必须把 fanlogic.h 列为依赖：守护 #include 它，但初版只写了 .c
+#    ⇒ 改头文件后 make **不会**重编守护，而 tests/unit_logic 的规则**列了**这个头文件
+#    ⇒ 测试用新逻辑跑绿、发布的守护却是旧逻辑编的。这个不对称已经真的咬过一次。
+$(SRC)/fanpilotd: $(SRC)/fanpilotd.c $(SRC)/fanlogic.h
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
 
 $(SRC)/fanctl: $(SRC)/fanctl.c

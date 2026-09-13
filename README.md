@@ -47,7 +47,7 @@ FanPilot 依赖 SMC 的 `F*Tg` 键可写、`FNum` 可读、`Tp*` 传感器存在
 所以**先确认你的机器支不支持，再装东西**——不要先装一个 root 守护、然后才发现不兼容。
 
 ```bash
-tar -xzf FanPilot-1.0.0.tar.gz && cd FanPilot-1.0.0
+tar -xzf FanPilot-1.0.1.tar.gz && cd FanPilot-1.0.0
 bash install/precheck.sh
 ```
 
@@ -69,10 +69,10 @@ bash install/precheck.sh
 
 ### 方式 A：用安装包（推荐）
 
-从 [Releases](https://github.com/neosun100/FanPilot/releases/latest) 下载 `FanPilot-1.0.0.tar.gz`：
+从 [Releases](https://github.com/neosun100/FanPilot/releases/latest) 下载 `FanPilot-1.0.1.tar.gz`：
 
 ```bash
-tar -xzf FanPilot-1.0.0.tar.gz
+tar -xzf FanPilot-1.0.1.tar.gz
 cd FanPilot-1.0.0
 bash install.sh
 ```
