@@ -1,0 +1,10 @@
+# 编译产物
+research/smcprobe
+research/sensors
+research/sample
+research/tf
+*.o
+.build/
+build/
+DerivedData/
+.DS_Store
