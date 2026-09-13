@@ -11,3 +11,5 @@ DerivedData/
 src/fanctl
 src/fanpilotd
 state/
+app/.build/
+app/FanPilot.app/

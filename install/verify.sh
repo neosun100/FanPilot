@@ -120,6 +120,26 @@ wl="$(grep -c '"F0md","F1md","F0Tg","F1Tg"' "$(dirname "$0")/../src/fanpilotd.c"
 chk "$([ $? = 4 ] && echo 0 || echo 1)" "第二个实例被拒绝启动" "单实例锁失效"
 rm -f /tmp/verify-dup.json
 
+# ⭐ 配置是不可信输入（它对用户可写，否则菜单栏 App 改不了）
+#    ⇒ 安全阈值必须被硬夹，不能相信文件里写的值
+EVIL=/tmp/verify-evil.conf
+printf 'emergency_temp = 200\npoll_interval = 0.01\nema_seconds = 9999\ndeadband = 99999\nslew_up = 1\n' > "${EVIL}"
+eff="$("${BIN}" --config "${EVIL}" --check-config 2>/dev/null)"
+clamp(){ # $1=键 $2=期望值 $3=为什么
+  got="$(printf '%s\n' "${eff}" | awk -F= -v k="$1" '$1==k{print $2;exit}')"
+  if awk -v a="${got:-0}" -v b="$2" 'BEGIN{exit !(a-b<0.01 && b-a<0.01)}'; then
+    ok "$1 被夹到 $2（$3）"
+  else
+    bad "$1 = ${got:-读不到}，期望 $2" "$3 —— 安全阈值可被配置绕过"
+  fi
+}
+clamp emergency_temp 95   "紧急过热保护不许被调没"
+clamp poll_interval  0.50 "不许把守护自己写成 CPU 大户"
+clamp ema_seconds    120  "平滑过久等于不响应升温"
+clamp deadband       500  "死区过大等于不控制"
+clamp slew_up        10   "升速过慢等于升不上去"
+rm -f "${EVIL}"
+
 echo
 echo "═══════════════════════════════"
 printf '  通过 %d · 失败 %d\n' "${PASS}" "${FAIL}"

@@ -220,10 +220,16 @@ static double curve_eval(double t){
 }
 
 // 把目标夹到该风扇的合法区间（S2：上下限运行时读取，不硬编码）
-static double clamp_fan(int f, double rpm){
+//
+// ⚠️ emergency=1 时**忽略用户配置的 max_rpm**，只受硬件上限约束。
+//    🩸 初版没有这个参数，于是留了个洞：配置文件为了让菜单栏 App 能改而对用户可写，
+//       若 max_rpm 被设得很低（手误，或以用户身份运行的恶意程序），
+//       90°C 的紧急打满会被这个用户上限挡住 —— **安全路径不该受用户配置约束**。
+//    通则：保护性逻辑的边界必须来自硬件/系统，不能来自可被降级的配置。
+static double clamp_fan(int f, double rpm, int emergency){
     double lo = cfg.min_rpm > g_fmin[f] ? cfg.min_rpm : g_fmin[f];
     double hi = g_fmax[f];
-    if (cfg.max_rpm > 0 && cfg.max_rpm < hi) hi = cfg.max_rpm;
+    if (!emergency && cfg.max_rpm > 0 && cfg.max_rpm < hi) hi = cfg.max_rpm;
     if (hi < lo) hi = lo;
     if (rpm < lo) rpm = lo;
     if (rpm > hi) rpm = hi;
@@ -278,8 +284,25 @@ static void cfg_load(const char *path){
         else if (!strcmp(k,"curve"))          parse_curve(v);
     }
     fclose(fp);
+
+    // ── 🔴 配置是**不可信输入**，安全相关的值必须硬夹，不能相信文件里写的
+    //
+    // 为什么：配置文件对普通用户可写（否则菜单栏 App 改不了配置）。
+    // 于是手误或以用户身份运行的程序都能改它。安全阈值若可被配置任意放大，
+    // 保护就等于不存在。
+    //   🩸 实测发现的两个洞：
+    //     ① max_rpm 设很低 ⇒ 紧急打满被用户上限挡住（已在 clamp_fan 用 emergency 参数修）
+    //     ② emergency_temp 设 200 ⇒ **紧急保护被整个禁用**（本处修）
+    // ⭐ 通则：保护性阈值的边界必须来自代码/硬件，不能来自可被降级的配置。
     if (cfg.poll_interval < 0.5) cfg.poll_interval = 0.5;   // 防止把自己写成 CPU 大户
-    if (cfg.ema_seconds < 1) cfg.ema_seconds = 1;
+    if (cfg.poll_interval > 30)  cfg.poll_interval = 30;    // 太慢会来不及响应升温
+    if (cfg.ema_seconds < 1)     cfg.ema_seconds = 1;
+    if (cfg.ema_seconds > 120)   cfg.ema_seconds = 120;     // 平滑过久等于不响应
+    if (cfg.emergency_temp > 95) cfg.emergency_temp = 95;   // ⭐ 硬上限：不许把保护调没
+    if (cfg.emergency_temp < 70) cfg.emergency_temp = 70;   // 也不许低到天天误触发
+    if (cfg.slew_up < 10)        cfg.slew_up = 10;          // 太小等于升不上去
+    if (cfg.deadband < 0)        cfg.deadband = 0;
+    if (cfg.deadband > 500)      cfg.deadband = 500;        // 太大等于不控制
 }
 
 static void write_status(const char *path, double hot, double ema,
@@ -314,15 +337,31 @@ static void write_status(const char *path, double hot, double ema,
 int main(int argc, char **argv){
     const char *cfg_path    = "/usr/local/etc/fanpilot.conf";
     const char *status_path = "/var/run/fanpilot.status.json";
-    int oneshot = 0;
+    int oneshot = 0, check_only = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--config") && i+1 < argc) cfg_path = argv[++i];
         else if (!strcmp(argv[i], "--status") && i+1 < argc) status_path = argv[++i];
         else if (!strcmp(argv[i], "--oneshot")) oneshot = 1;
+        else if (!strcmp(argv[i], "--check-config")) check_only = 1;
     }
 
     cfg_defaults();
     cfg_load(cfg_path);
+
+    // --check-config：只加载并打印**生效后**的配置就退出。
+    // 不占单实例锁、不打开 SMC —— 所以可以在守护正常运行时随时校验一份配置文件。
+    // （加这个模式的直接原因：测「恶意配置能否绕过安全夹取」时被单实例锁挡住了，
+    //   说明缺一条「只读校验」的路径。安全机制不该妨碍对安全机制的测试。）
+    if (check_only) {
+        printf("poll_interval=%.2f\nmin_rpm=%.0f\nmax_rpm=%.0f\nema_seconds=%.1f\n"
+               "slew_up=%.0f\nslew_down=%.0f\ndeadband=%.0f\nemergency_temp=%.1f\n"
+               "curve_points=%d\n",
+               cfg.poll_interval, cfg.min_rpm, cfg.max_rpm, cfg.ema_seconds,
+               cfg.slew_up, cfg.slew_down, cfg.deadband, cfg.emergency_temp, cfg.n_curve);
+        for (int i = 0; i < cfg.n_curve; i++)
+            printf("curve%d=%.1f:%.0f\n", i, cfg.curve[i].t, cfg.curve[i].rpm);
+        return 0;
+    }
 
     // ── 🩸 单实例锁（Phase 1 测试实测踩到的缺陷）
     //
@@ -377,7 +416,7 @@ int main(int argc, char **argv){
 
     // 起步：先 md=1 再写 Tg（PLAN §4.2：顺序反了会有「已切手动但目标为0」窗口）
     for (int f = 0; f < NFAN; f++) {
-        g_cur_target[f] = clamp_fan(f, cfg.min_rpm);
+        g_cur_target[f] = clamp_fan(f, cfg.min_rpm, 0);
         if (key_write_u8(&g_md[f], 1) != 0) {
             fprintf(stderr, "✗ 无法切手动模式（需要 root）—— 退出\n");
             return 1;
@@ -414,7 +453,7 @@ int main(int argc, char **argv){
 
         double ac[NFAN], tg[NFAN];
         for (int f = 0; f < NFAN; f++) {
-            double target = clamp_fan(f, want);
+            double target = clamp_fan(f, want, emergency);
 
             // ④ 变化率限幅（非对称：升快降慢）；紧急情况忽略限幅
             if (!emergency) {

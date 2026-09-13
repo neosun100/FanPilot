@@ -61,6 +61,24 @@ CONF
   echo "  ✅ ${CONF_DST}（默认配置）"
 fi
 
+# 让配置对控制台用户可写 —— 否则菜单栏 App（无特权）改不了配置。
+#
+# 🔴 这是一个刻意做出的权衡，必须说清楚：
+#   代价：配置成为**不可信输入**（手误或以用户身份运行的程序都能改）
+#   为什么可接受：守护把所有安全相关的值**硬夹**在代码里，不相信配置文件 ——
+#     · 目标转速夹在运行时读到的 F*Mn~F*Mx 内（S2）
+#     · emergency_temp 夹在 70~95°C（不许把紧急保护调没）
+#     · 紧急路径忽略用户 max_rpm，只受硬件上限约束
+#   ⇒ 最坏情况是风扇转速在合法范围内被改动，紧急过热保护**无法**被绕过。
+# ⚠️ 必须用 /usr/bin/stat 绝对路径：若装了 GNU coreutils，`stat` 会被它抢占，
+#    而 GNU stat 的 `-f` 是「查文件系统」不是「格式化输出」—— 会静默返回一堆
+#    文件系统信息当成用户名。（本项目已被这个坑咬过 3 次：install.sh / 两处调研脚本。）
+CONSOLE_USER="$(/usr/bin/stat -f '%Su' /dev/console 2>/dev/null || echo root)"
+if [ -n "${CONSOLE_USER}" ] && [ "${CONSOLE_USER}" != "root" ]; then
+  chown "${CONSOLE_USER}" "${CONF_DST}"
+  echo "  ✅ 配置属主 → ${CONSOLE_USER}（菜单栏 App 可编辑；安全阈值仍由守护硬夹）"
+fi
+
 echo "=== 3. 卸载旧实例（若有）——轮询等 label 真消失（坑6）==="
 if launchctl print "system/${LABEL}" >/dev/null 2>&1; then
   launchctl bootout "system/${LABEL}" 2>/dev/null || true
