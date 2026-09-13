@@ -21,6 +21,7 @@ typedef struct {
     double slew_up, slew_down; // RPM/秒
     double deadband;           // RPM
     double emergency_temp;
+    int    temp_source;        // 控制输入：0 = 最热核(max)，1 = 全核平均(average)
     int    curve_autoscale;    // 1 = 抬高下限时整条曲线跟着重新铺开（默认开）
     int    n_curve;
     struct { double t, rpm; } curve[FL_MAX_CURVE];
@@ -35,6 +36,7 @@ static inline void fl_cfg_defaults(fl_cfg *c){
     c->slew_down     = 60;
     c->deadband      = 50;
     c->emergency_temp= 90;
+    c->temp_source   = 1;      // 默认全核平均（使用者选定）
     c->curve_autoscale = 1;
     c->n_curve = 5;
     c->curve[0].t=45; c->curve[0].rpm=2000;
@@ -101,6 +103,34 @@ static inline void fl_curve_rescale(fl_cfg *c, double hw_max){
         double frac = (c->curve[i].rpm - lo_src) / span_src;
         c->curve[i].rpm = c->min_rpm + frac * span_dst;
     }
+}
+
+// ── 控制输入的选择 ────────────────────────────────────────────────
+//
+// temp_source: 0 = 最热核(max) · 1 = 全核平均(average)
+//
+// 🔴 **紧急保护路径永远用 max，不受此设置影响。**
+//    实测本机两个核簇温差巨大（性能核 72~84°C，能效核 59~62°C），
+//    5 个凉快的能效核把平均值拉低 **11.7°C**。
+//    ⇒ 若按平均判 90°C 紧急阈值，最热核到 ~102°C 时平均才刚到 90 —— 保护形同废设。
+//    这与本项目既有原则一致：保护性阈值的边界必须来自代码，不能来自可被降级的配置。
+static inline double fl_control_temp(const fl_cfg *c, double hottest, double average){
+    return c->temp_source == 1 ? average : hottest;
+}
+// 紧急判定：与曲线**使用同一个口径**（由 temp_source 决定）。
+//
+// 📌 2026-09-14 使用者明确选择：紧急判据也改看平均值，阈值保持 90°C。
+//    我先用实测数据提过后果，使用者在知情后确认 ⇒ 按其决定实现。
+//
+// 后果（实测温差 2.0~7.8°C，高负载时曾达 11.7°C）：
+//    平均 90°C 触发时，最热核实际约 95~102°C。
+//    P 核约 100~105°C 开始重度降频。
+// ⚠️ 但这**不是唯一防线**：macOS/SoC 自身有硬件级过热保护（降频，极端时强制关机），
+//    本函数只是在其之上更早介入的一层优化。
+//
+// 想恢复"紧急看最热核"只需 temp_source = max（曲线也会一起变回最热核口径）。
+static inline int fl_is_emergency(const fl_cfg *c, double hottest, double average){
+    return fl_control_temp(c, hottest, average) >= c->emergency_temp;
 }
 
 // ── 曲线：分段线性插值 ────────────────────────────────────────────

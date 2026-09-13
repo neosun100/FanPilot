@@ -34,12 +34,14 @@ struct ConfigInfo: Decodable {
     let deadband: Double
     let emergency_temp: Double?
     let curve_autoscale: Int?
+    let temp_source: String?      // "average" | "max"（旧版状态文件没有此字段）
 }
 
 struct Status: Decodable {
     let ts: Double
     let mode: String
     let temp_hottest_c: Double
+    let temp_average_c: Double?   // 全核平均（旧版状态文件没有）
     let temp_smoothed_c: Double
     let sensors: Int
     let writes_total: Int
@@ -281,7 +283,12 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // 平均值天然是故障指示器：一个风扇停转 ⇒ 平均腰斩（2000 → 1000）一眼可见。
         // （若两风扇目标各异，平均就会掩盖故障 —— 那时才必须改成别的口径。）
         let avgRPM = s.fans.map(\.actual_rpm).reduce(0, +) / Double(max(s.fans.count, 1))
-        let temp = String(format: "%.0f°", s.temp_hottest_c)   // 省一个字符宽；单位含义靠 ° 已足够
+        // ⭐ 菜单栏显示**控制层实际使用的那个数** —— 显示与控制必须同源，
+        //    否则会出现「菜单栏 72° 为什么风扇满转」这种无法解释的不一致。
+        let ctlTemp = (s.config.temp_source == "average")
+            ? (s.temp_average_c ?? s.temp_hottest_c)
+            : s.temp_hottest_c
+        let temp = String(format: "%.0f°", ctlTemp)   // 省一个字符宽；单位含义靠 ° 已足够
         let rpm  = String(format: "%.0f", avgRPM)
 
         let anyFault = s.fans.contains { $0.fault == true }
@@ -332,7 +339,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         _ = dynItem()          // 1  陈旧告警（平时 isHidden）
         m.addItem(.separator())
         _ = dynItem()          // 2  最热核心
-        _ = dynItem()          // 3  平滑后
+        _ = dynItem()          // 3  全核平均
+        _ = dynItem()          // 4  平滑后
         m.addItem(.separator())
         for _ in 0..<fanCount {
             _ = dynItem()      // 风扇标题
@@ -406,7 +414,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         // 风扇数变了才重建骨架（正常永不发生，但别假设）
-        let need = 8 + s.fans.count * 3
+        let need = 9 + s.fans.count * 3
         if !menuBuilt || dyn.count != need { buildMenuSkeleton(fanCount: s.fans.count) }
         guard dyn.count == need else { return }
 
@@ -424,9 +432,18 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let age = Int(Date().timeIntervalSince1970 - s.ts)
         set("⚠️ 状态已陈旧 \(age) 秒 —— 守护可能已卡住", hidden: s.isFresh)
 
-        set(String(format: "最热核心   %.1f °C   (%d 个传感器取最大)",
-                   s.temp_hottest_c, s.sensors))
-        set(String(format: "平滑后     %.1f °C   (EMA %.0fs，控制用的就是这个)",
+        // 标注哪个口径在起作用：控制与紧急判据现在**同口径**（temp_source 决定）
+        let isAvg = (s.config.temp_source == "average")
+        let tag = " · 控制 + 紧急判据"
+        set(String(format: "最热核心   %.1f °C   (%d 个传感器取最大%@)",
+                   s.temp_hottest_c, s.sensors, isAvg ? "" : tag))
+        if let a = s.temp_average_c {
+            set(String(format: "全核平均   %.1f °C   (%d 个传感器%@)",
+                       a, s.sensors, isAvg ? tag : ""))
+        } else {
+            set("全核平均   —（守护版本较旧）", hidden: true)
+        }
+        set(String(format: "平滑后     %.1f °C   (EMA %.0fs，喂给曲线的就是这个)",
                    s.temp_smoothed_c, s.config.ema_seconds))
 
         for f in s.fans {
