@@ -33,11 +33,15 @@ nocomment_swift(){ sed 's|^[[:space:]]*///*.*$||' "$1"; }
 
 [ "$(id -u)" = "0" ] || { echo "需要 root：sudo $0" >&2; exit 2; }
 
+# 控制台用户：写配置后要把属主还回去（本脚本以 root 跑）
+CONSOLE_USER_G="$(/usr/bin/stat -f '%Su' /dev/console 2>/dev/null || echo root)"
+
 BACKUP="$(mktemp)"
 cp "${CONF}" "${BACKUP}" 2>/dev/null || true
 restore(){
   if [ -s "${BACKUP}" ]; then
     cp "${BACKUP}" "${CONF}"
+    chown "${CONSOLE_USER_G}" "${CONF}" 2>/dev/null || true   # 同上：别留下 root 属主
     sleep 6      # 等守护自动重载回原配置
   fi
   rm -f "${BACKUP}" /tmp/e2e-*.conf /tmp/e2e-*.json /tmp/e2e-*.png
@@ -57,6 +61,11 @@ set_key(){
       } else print line }
     END { if (!done) print k " = " v }' "${CONF}" > "${tmp}"
   mv "${tmp}" "${CONF}"
+  # 🩸 本脚本以 root 运行，临时文件由 root 创建，mv 之后配置属主会变成 root
+  #    ⇒ 菜单栏 App（无特权）再也写不了它 —— **测试把它所测试的功能弄坏了**。
+  #    实测踩过：用户点「转速下限」直接弹 Permission denied，而 verify/e2e 双双通过。
+  #    所以每次写完都必须把属主还回控制台用户。
+  chown "${CONSOLE_USER_G}" "${CONF}" 2>/dev/null || true
 }
 wait_reload(){ sleep 7; }   # 守护每 poll_interval 检查 mtime；给足余量
 

@@ -59,6 +59,83 @@ func readStatus() -> Status? {
     return try? JSONDecoder().decode(Status.self, from: data)
 }
 
+
+// ───────────────────────── 开机自启（用户域 LaunchAgent）─────────────────────────
+//
+// 只管**菜单栏 App** 自己的自启。
+// ⛔ 刻意不提供「守护的自启开关」：守护是真正控风扇的那一半，关掉它风扇就交还固件，
+//    整个工具失去意义；而且它是 root LaunchDaemon，改它需要提权。
+//    ⇒ 把「显示层的自启」和「控制层的自启」混成一个开关会误导人。
+enum LoginItem {
+    static let label = "com.newmac.fanpilot.menu"
+    static var plistURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/LaunchAgents/\(label).plist")
+    }
+    static let appPath = "/Applications/FanPilot.app/Contents/MacOS/FanPilot"
+
+    /// 判**当前事实**：决定「下次登录会不会起」的是 plist 是否存在。
+    /// （不判「我执行过 bootstrap」—— 那是动作不是事实。）
+    static var isEnabled: Bool {
+        FileManager.default.fileExists(atPath: plistURL.path)
+    }
+
+    /// 当前是否真的被 launchd 管着（用于区分「已启用但本次没加载」）
+    static var isLoaded: Bool {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        p.arguments = ["print", "gui/\(getuid())/\(label)"]
+        p.standardOutput = FileHandle.nullDevice
+        p.standardError  = FileHandle.nullDevice
+        do { try p.run() } catch { return false }
+        p.waitUntilExit()
+        return p.terminationStatus == 0
+    }
+
+    private static let plistBody = """
+    <?xml version="1.0" encoding="UTF-8"?>
+    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+    <plist version="1.0">
+    <dict>
+      <key>Label</key><string>\(label)</string>
+      <key>ProgramArguments</key><array><string>\(appPath)</string></array>
+      <key>RunAtLoad</key><true/>
+      <!-- 显示层不用 KeepAlive：它挂了不影响风扇控制（守护是独立的 root LaunchDaemon）。
+           KeepAlive 是给「挂了就有安全后果」的东西用的，不是给所有东西用的。 -->
+      <key>KeepAlive</key><false/>
+      <key>ProcessType</key><string>Interactive</string>
+      <key>StandardOutPath</key><string>/tmp/fanpilot-menu.log</string>
+      <key>StandardErrorPath</key><string>/tmp/fanpilot-menu.log</string>
+    </dict>
+    </plist>
+    """
+
+    @discardableResult
+    static func enable() -> Bool {
+        let dir = plistURL.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        guard (try? plistBody.write(to: plistURL, atomically: true, encoding: .utf8)) != nil
+        else { return false }
+        // 立即 bootstrap，这样不用等到下次登录也算「已启用且已加载」
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        p.arguments = ["bootstrap", "gui/\(getuid())", plistURL.path]
+        p.standardError = FileHandle.nullDevice
+        try? p.run(); p.waitUntilExit()
+        return isEnabled
+    }
+
+    /// 关闭自启 = 删掉 plist。
+    /// 🩸 刻意**不**调 `launchctl bootout`：那会立刻杀掉正在运行的本 App，
+    ///    用户点一下「关闭开机自启」结果 App 消失，看起来像崩溃。
+    ///    「以后开机不再启动」≠「现在退出」—— 这两件事不能混。
+    @discardableResult
+    static func disable() -> Bool {
+        try? FileManager.default.removeItem(at: plistURL)
+        return !isEnabled
+    }
+}
+
 // ───────────────────────── 菜单栏 ─────────────────────────
 
 final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -69,6 +146,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var dyn: [NSMenuItem] = []
     private var menuBuilt = false
     private var floorItems: [NSMenuItem] = []
+    private var loginItem: NSMenuItem?
     /// 可选下限档位（6 档）。
     /// ⭐ 刻意**不做自由输入框**：输错一个数字就可能把机器闷住或让风扇常驻高噪，
     ///   而这里根本不需要连续可调 —— 高温段的转速由曲线自适应接管，
@@ -269,6 +347,14 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // ⭐ 唯一需要用户调的东西：转速下限。
         //    不给「编辑配置文件」和「重新加载」——让用户去编辑配置文件、再手动 reload，
         //    本身就是设计失败。守护监视配置 mtime 自动重载，所以点一下即刻生效。
+        // 开机自启（可切换）+ 守护自启状态（只读，因为它必须常开）
+        loginItem = NSMenuItem(title: "开机自动启动",
+                               action: #selector(toggleLogin), keyEquivalent: "")
+        loginItem?.target = self
+        m.addItem(loginItem!)
+        _ = dynItem(1)     // 守护自启状态（只读）
+        m.addItem(.separator())
+
         let floorItem = NSMenuItem(title: "转速下限", action: nil, keyEquivalent: "")
         let floorMenu = NSMenu()
         // 一句话掐掉最容易产生的误解（选高档 ≠ 高负载时更凉）
@@ -319,7 +405,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         // 风扇数变了才重建骨架（正常永不发生，但别假设）
-        let need = 7 + s.fans.count * 3
+        let need = 8 + s.fans.count * 3
         if !menuBuilt || dyn.count != need { buildMenuSkeleton(fanCount: s.fans.count) }
         guard dyn.count == need else { return }
 
@@ -357,11 +443,43 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         set(String(format: "轮询 %.1fs  ·  累计写入 SMC %d 次",
                    s.config.poll_interval, s.writes_total))
 
+        // 守护自启状态（只读）：它必须常开，所以不给开关，但要**显式显示出来**
+        let dPlist = "/Library/LaunchDaemons/com.newmac.fanpilotd.plist"
+        let dOn = FileManager.default.fileExists(atPath: dPlist)
+        set(dOn ? "风扇控制守护：开机自启 ✓（系统级，始终开启）"
+                : "⚠️ 风扇控制守护未安装开机自启 —— 重启后风扇将交还固件")
+
         // 勾选当前生效的下限（读的是守护报告的**生效值**，不是我们以为写进去的值）
         for mi in floorItems {
             mi.state = (abs(Double(mi.tag) - s.config.min_rpm) < 1) ? .on : .off
         }
+        refreshLoginItem()
     }
+
+    /// 自启勾选状态。判**当前事实**（plist 是否存在），不判「我点过开关」。
+    private func refreshLoginItem() {
+        guard let li = loginItem else { return }
+        let on = LoginItem.isEnabled
+        li.state = on ? .on : .off
+        // 「已启用但本次未加载」是个真实存在的中间态，必须说出来而不是显示成正常
+        if on && !LoginItem.isLoaded {
+            li.title = "开机自动启动（已启用，下次登录生效）"
+        } else {
+            li.title = "开机自动启动"
+        }
+    }
+
+    @objc private func toggleLogin() {
+        let want = !LoginItem.isEnabled
+        let ok = want ? LoginItem.enable() : LoginItem.disable()
+        if !ok {
+            notify("设置开机自启失败",
+                   want ? "写不了 \(LoginItem.plistURL.path)"
+                        : "删不掉 \(LoginItem.plistURL.path)")
+        }
+        refreshLoginItem()
+    }
+
 
     // 菜单即将打开时立刻刷一次，避免展示上一个 tick 的旧值
     func menuWillOpen(_ menu: NSMenu) { refresh() }
@@ -406,7 +524,16 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
             try text.write(to: tmp, atomically: false, encoding: .utf8)
             _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
         } catch {
-            notify("改配置失败", "写不了 \(configPath)：\(error.localizedDescription)")
+            // 报错要给**可操作**的下一步，不能只说「失败了」
+            notify("改配置失败",
+                   """
+                   写不了 \(configPath)
+
+                   \(error.localizedDescription)
+
+                   多半是配置属主被改成了 root。修复：
+                   sudo chown $(whoami) \(configPath)
+                   """)
             return
         }
         // 不弹成功提示：下一次 refresh(≤2s) 菜单里的勾选与数值会自己更新，

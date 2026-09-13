@@ -27,6 +27,18 @@ echo "═══ A. 安装完整性 ═══"
 [ -f "${PLIST}" ] && ok "plist 存在"                   || bad "plist 缺失" ""
 [ -f "${CONF}" ]  && ok "配置存在"                     || bad "配置缺失" ""
 
+# ⭐ 这条判据本来缺失，导致「配置被改成 root 属主」时验收仍全绿、而用户一点就报错。
+#    通则：凡是「某个身份必须能做某件事」的前提，就必须有一条以**那个身份**去试的判据。
+CU="$(/usr/bin/stat -f '%Su' /dev/console 2>/dev/null || echo root)"
+if [ -n "${CU}" ] && [ "${CU}" != "root" ]; then
+  sudo -u "${CU}" test -w "${CONF}" \
+    && ok "控制台用户 ${CU} 可写配置文件（菜单栏改设置才能生效）" \
+    || bad "控制台用户 ${CU} **不能写** ${CONF}" "菜单栏「转速下限」会弹 Permission denied"
+  sudo -u "${CU}" test -w "$(dirname "${CONF}")" \
+    && ok "控制台用户可写配置目录（原子写需要）" \
+    || bad "控制台用户不能写配置目录" "原子写会失败"
+fi
+
 echo "═══ B. 运行状态 ═══"
 state="$(launchctl print "system/${LABEL}" 2>/dev/null | awk -F'= *' '/^[[:space:]]*state =/{print $2;exit}')"
 [ "${state}" = "running" ] && ok "state = running" || bad "state = ${state:-不存在}" "守护没在跑"
