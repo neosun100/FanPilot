@@ -76,34 +76,69 @@ final class Controller: NSObject, NSApplicationDelegate {
 
     /// 菜单栏两行显示（沿用原软件 menubarTwoLines 的习惯）：上行温度、下行转速
     ///
-    /// 🩸 垂直居中要显式做，不能指望默认行为：
-    ///   初版用 `lineSpacing = -2.5` 挤压行距，结果整块文字**靠上对齐**（用户实测反馈）。
-    ///   负的 lineSpacing 会让 AppKit 的多行布局往上溢出。
-    /// ⭐ 正解：用 min/maxLineHeight **固定每行高度**（不要用负行距），
-    ///   再用 baselineOffset 把整块下移到按钮垂直中心。
-    ///   状态栏按钮高约 22pt，两行 × lineH ⇒ 上下各留 (22 - 2*lineH)/2。
-    private func twoLineTitle(_ top: String, _ bottom: String, dim: Bool) -> NSAttributedString {
-        let fontSize: CGFloat = 9
-        let lineH: CGFloat = 9.5          // 每行固定高度（正值，别用负行距）
-        let p = NSMutableParagraphStyle()
-        p.alignment = .right
-        p.lineSpacing = 0
-        p.minimumLineHeight = lineH
-        p.maximumLineHeight = lineH
-        let color: NSColor = dim ? .disabledControlTextColor : .labelColor
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: fontSize, weight: .regular),
-            .paragraphStyle: p,
-            .foregroundColor: color,
-            // 负值 = 整块下移。菜单栏文字默认贴上沿，这里把它压到垂直居中。
-            .baselineOffset: NSNumber(value: -1.0),
-        ]
-        return NSAttributedString(string: "\(top)\n\(bottom)", attributes: attrs)
+    /// 🩸 走了两次弯路才找到正解，记下来免得再犯：
+    ///   ① 初版 `attributedTitle` + `lineSpacing = -2.5`：负行距让 AppKit 多行布局
+    ///      往上溢出 ⇒ 整块**靠上对齐**（用户实测反馈）
+    ///   ② 二版改 min/maxLineHeight + `baselineOffset`：**仍然靠上**
+    ///      —— NSStatusItem 按钮对多行 attributedTitle **不给精确的垂直控制**
+    ///
+    /// ⭐ 正解是绕开 AppKit 的文本基线布局：**自己渲染成 NSImage，在图像内做精确居中**。
+    ///   像素级可控；且 `isTemplate = true` 让 AppKit 按浅色/深色菜单栏自动着色，
+    ///   连主题适配都免了（若画成彩色位图反而要自己监听外观变化重绘）。
+    private func twoLineImage(_ top: String, _ bottom: String, dim: Bool) -> NSImage {
+        let h = NSStatusBar.system.thickness          // 实测本机 22pt
+        // ⭐ 字号由「两行必须装进 h」反推，不能拍脑袋：
+        //    9pt 字体行高约 11pt ⇒ 两行 23pt > 22pt，块本身装不下，
+        //    溢出只能往上顶 —— 这才是「靠上对齐」的真因（不是偏移没调对）。
+        let fontSize: CGFloat = 8
+        let font = NSFont.monospacedDigitSystemFont(ofSize: fontSize, weight: .medium)
+        let attrs: [NSAttributedString.Key: Any] = [.font: font,
+                                                    .foregroundColor: NSColor.black]
+        let sTop = NSAttributedString(string: top, attributes: attrs)
+        let sBot = NSAttributedString(string: bottom, attributes: attrs)
+
+        let wTop = ceil(sTop.size().width), wBot = ceil(sBot.size().width)
+        let w = max(wTop, wBot) + 2
+        // 用**字形实际视觉高度**（ascender+|descender|）而不是 size().height
+        // —— 后者含 leading（行间预留），两行叠加会凭空多出 2~3pt。
+        let glyphH = ceil(font.ascender - font.descender)
+        let gap: CGFloat = 0
+        let blockH = glyphH * 2 + gap
+        let pad = max(0, (h - blockH) / 2)             // 装不下时退化为 0，不出现负偏移
+
+        let img = NSImage(size: NSSize(width: w, height: h))
+        img.lockFocus()
+        // 非翻转坐标系：y 从底部起算，所以下行在下、上行在上
+        sBot.draw(at: NSPoint(x: w - wBot - 1, y: pad))
+        sTop.draw(at: NSPoint(x: w - wTop - 1, y: pad + glyphH + gap))
+        img.unlockFocus()
+        img.isTemplate = true
+        if dim {
+            let dimmed = NSImage(size: img.size)
+            dimmed.lockFocus()
+            img.draw(at: .zero, from: .zero, operation: .sourceOver, fraction: 0.45)
+            dimmed.unlockFocus()
+            dimmed.isTemplate = true
+            return dimmed
+        }
+        return img
+    }
+
+    /// 供 --render-preview 用：拿到与菜单栏完全相同的那张图
+    func previewImage(_ top: String, _ bottom: String) -> NSImage {
+        twoLineImage(top, bottom, dim: false)
+    }
+
+    private func setTitle(_ top: String, _ bottom: String, dim: Bool) {
+        guard let b = item.button else { return }
+        b.image = twoLineImage(top, bottom, dim: dim)
+        b.imagePosition = .imageOnly
+        b.title = ""
     }
 
     private func refresh() {
         guard let s = readStatus() else {
-            item.button?.attributedTitle = twoLineTitle("FanPilot", "守护未运行", dim: true)
+            setTitle("FanPilot", "守护未运行", dim: true)
             buildMenu(nil)
             return
         }
@@ -113,13 +148,13 @@ final class Controller: NSObject, NSApplicationDelegate {
 
         if !s.isFresh {
             // 陈旧就要说出来，绝不静默展示旧值
-            item.button?.attributedTitle = twoLineTitle("\(temp) ⚠️", "陈旧", dim: true)
+            setTitle("\(temp) ⚠️", "陈旧", dim: true)
         } else if s.mode == "emergency" {
-            item.button?.attributedTitle = twoLineTitle("\(temp) 🔥", rpm, dim: false)
+            setTitle("\(temp) 🔥", rpm, dim: false)
         } else if s.mode.hasPrefix("failsafe") || s.mode.hasPrefix("stopped") {
-            item.button?.attributedTitle = twoLineTitle("\(temp) ⚠️", "固件控", dim: true)
+            setTitle("\(temp) ⚠️", "固件控", dim: true)
         } else {
-            item.button?.attributedTitle = twoLineTitle(temp, rpm, dim: false)
+            setTitle(temp, rpm, dim: false)
         }
         buildMenu(s)
     }
@@ -205,6 +240,43 @@ final class Controller: NSObject, NSApplicationDelegate {
     }
 
     @objc private func quit() { NSApp.terminate(nil) }
+}
+
+// --render-preview <png>：把菜单栏那张图连同状态栏边界一起渲染出来，用于**自己**验证
+// 垂直居中，而不是让使用者反复肉眼判断。
+// （对齐问题连修两版都没中，就是因为我没有可检验的判据 —— 全靠别人看。）
+if let i = CommandLine.arguments.firstIndex(of: "--render-preview"),
+   i + 1 < CommandLine.arguments.count {
+    let out = CommandLine.arguments[i + 1]
+    let ctrl = Controller()
+    let img = ctrl.previewImage("57°C", "2384")
+    let h = NSStatusBar.system.thickness
+    // 放大 6 倍 + 画出状态栏上下边界，肉眼/程序都能判断是否居中
+    let scale: CGFloat = 6
+    let canvas = NSImage(size: NSSize(width: img.size.width * scale, height: h * scale))
+    canvas.lockFocus()
+    NSColor.white.setFill()
+    NSRect(origin: .zero, size: canvas.size).fill()
+    // 上下边界线（状态栏可用区域）
+    NSColor.systemRed.withAlphaComponent(0.5).setStroke()
+    let top = NSBezierPath(); top.move(to: NSPoint(x: 0, y: canvas.size.height - 0.5))
+    top.line(to: NSPoint(x: canvas.size.width, y: canvas.size.height - 0.5)); top.stroke()
+    let bot = NSBezierPath(); bot.move(to: NSPoint(x: 0, y: 0.5))
+    bot.line(to: NSPoint(x: canvas.size.width, y: 0.5)); bot.stroke()
+    // 中线
+    NSColor.systemBlue.withAlphaComponent(0.4).setStroke()
+    let mid = NSBezierPath(); mid.move(to: NSPoint(x: 0, y: canvas.size.height / 2))
+    mid.line(to: NSPoint(x: canvas.size.width, y: canvas.size.height / 2)); mid.stroke()
+    img.draw(in: NSRect(origin: .zero, size: canvas.size),
+             from: .zero, operation: .sourceOver, fraction: 1.0)
+    canvas.unlockFocus()
+    if let tiff = canvas.tiffRepresentation,
+       let rep = NSBitmapImageRep(data: tiff),
+       let png = rep.representation(using: .png, properties: [:]) {
+        try? png.write(to: URL(fileURLWithPath: out))
+        print("已渲染 \(out)  状态栏高度=\(h)pt  图像=\(img.size)")
+    }
+    exit(0)
 }
 
 let app = NSApplication.shared
