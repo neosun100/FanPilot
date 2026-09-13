@@ -21,7 +21,8 @@ typedef struct {
     double slew_up, slew_down; // RPM/秒
     double deadband;           // RPM
     double emergency_temp;
-    int    temp_source;        // 控制输入：0 = 最热核(max)，1 = 全核平均(average)
+    int    temp_source;        // 曲线+显示口径：0=最热核(max) 1=全核平均(average) 2=最低核(min)
+    int    emergency_source;   // 紧急判据口径：同上取值，**独立于 temp_source**
     int    curve_autoscale;    // 1 = 抬高下限时整条曲线跟着重新铺开（默认开）
     int    n_curve;
     struct { double t, rpm; } curve[FL_MAX_CURVE];
@@ -36,7 +37,8 @@ static inline void fl_cfg_defaults(fl_cfg *c){
     c->slew_down     = 60;
     c->deadband      = 50;
     c->emergency_temp= 90;
-    c->temp_source   = 1;      // 默认全核平均（使用者选定）
+    c->temp_source     = 1;    // 曲线+显示：默认全核平均（使用者选定）
+    c->emergency_source= 1;    // 紧急判据：默认全核平均（使用者 2026-09-14 的明确决定）
     c->curve_autoscale = 1;
     c->n_curve = 5;
     c->curve[0].t=45; c->curve[0].rpm=2000;
@@ -114,8 +116,16 @@ static inline void fl_curve_rescale(fl_cfg *c, double hw_max){
 //    5 个凉快的能效核把平均值拉低 **11.7°C**。
 //    ⇒ 若按平均判 90°C 紧急阈值，最热核到 ~102°C 时平均才刚到 90 —— 保护形同废设。
 //    这与本项目既有原则一致：保护性阈值的边界必须来自代码，不能来自可被降级的配置。
-static inline double fl_control_temp(const fl_cfg *c, double hottest, double average){
-    return c->temp_source == 1 ? average : hottest;
+// 按口径取值。三档：0=最热核 1=全核平均 2=最低核
+static inline double fl_pick_temp(int src, double hottest, double average, double coolest){
+    if (src == 1) return average;
+    if (src == 2) return coolest;
+    return hottest;
+}
+// 曲线与菜单栏显示用的温度
+static inline double fl_control_temp(const fl_cfg *c,
+                                     double hottest, double average, double coolest){
+    return fl_pick_temp(c->temp_source, hottest, average, coolest);
 }
 // 紧急判定：与曲线**使用同一个口径**（由 temp_source 决定）。
 //
@@ -129,8 +139,18 @@ static inline double fl_control_temp(const fl_cfg *c, double hottest, double ave
 //    本函数只是在其之上更早介入的一层优化。
 //
 // 想恢复"紧急看最热核"只需 temp_source = max（曲线也会一起变回最热核口径）。
-static inline int fl_is_emergency(const fl_cfg *c, double hottest, double average){
-    return fl_control_temp(c, hottest, average) >= c->emergency_temp;
+// 🔴 紧急判据用**独立口径** emergency_source，不跟随 temp_source。
+//
+// 为什么拆开（2026-09-14）：使用者要在菜单栏自由切换温度口径（含「最低核」）。
+//   实测最低核比最热核低**约 24°C**（Tp1g 58.2 vs Tp0C 82.2）
+//   ⇒ 若紧急判据也用最低核，最低核要到 90°C 意味着整机已彻底失控，
+//     这道保护不是被削弱，而是**等于关掉**。
+//   ⇒ 所以曲线口径（可玩）与紧急口径（保护）分成两个设置，
+//     并在菜单里**显示**紧急口径，不做隐藏行为。
+// 默认 emergency_source = average（沿用使用者上一个明确决定）。
+static inline int fl_is_emergency(const fl_cfg *c,
+                                  double hottest, double average, double coolest){
+    return fl_pick_temp(c->emergency_source, hottest, average, coolest) >= c->emergency_temp;
 }
 
 // ── 曲线：分段线性插值 ────────────────────────────────────────────

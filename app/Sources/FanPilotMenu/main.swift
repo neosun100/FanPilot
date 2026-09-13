@@ -34,7 +34,8 @@ struct ConfigInfo: Decodable {
     let deadband: Double
     let emergency_temp: Double?
     let curve_autoscale: Int?
-    let temp_source: String?      // "average" | "max"（旧版状态文件没有此字段）
+    let temp_source: String?        // "max" | "average" | "min"
+    let emergency_source: String?   // 紧急判据口径，**独立**于 temp_source
 }
 
 struct Status: Decodable {
@@ -42,6 +43,7 @@ struct Status: Decodable {
     let mode: String
     let temp_hottest_c: Double
     let temp_average_c: Double?   // 全核平均（旧版状态文件没有）
+    let temp_coolest_c: Double?   // 最低核
     let temp_smoothed_c: Double
     let sensors: Int
     let writes_total: Int
@@ -149,6 +151,14 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var menuBuilt = false
     private var floorItems: [NSMenuItem] = []
     private var loginItem: NSMenuItem?
+    private var srcItems: [NSMenuItem] = []
+    /// 温度口径三档。决定**曲线与菜单栏显示**用哪个温度。
+    /// ⚠️ 紧急判据用独立设置 emergency_source，不跟随此项 —— 见 fanlogic.h 的说明。
+    static let tempSources: [(key: String, name: String, hint: String)] = [
+        ("max",     "最高核心温度", "最保守 · 风扇最早升速"),
+        ("average", "全核平均温度", "默认 · 比最高低约 3~13°C"),
+        ("min",     "最低核心温度", "最安静 · 比最高低约 20~25°C"),
+    ]
     /// 可选下限档位（6 档）。
     /// ⭐ 刻意**不做自由输入框**：输错一个数字就可能把机器闷住或让风扇常驻高噪，
     ///   而这里根本不需要连续可调 —— 高温段的转速由曲线自适应接管，
@@ -325,6 +335,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         m.delegate = self
         dyn.removeAll()
         floorItems.removeAll()
+        srcItems.removeAll()
 
         func dynItem(_ indent: Int = 0) -> NSMenuItem {
             let mi = NSMenuItem(title: "", action: nil, keyEquivalent: "")
@@ -362,6 +373,23 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         loginItem?.target = self
         m.addItem(loginItem!)
         _ = dynItem(1)     // 守护自启状态（只读）
+        m.addItem(.separator())
+
+        // ⭐ 温度口径：三档可切，改完即刻生效（守护监视配置 mtime）
+        let srcItem = NSMenuItem(title: "温度口径", action: nil, keyEquivalent: "")
+        let srcMenu = NSMenu()
+        let n1 = NSMenuItem(title: "决定曲线与菜单栏显示用哪个温度", action: nil, keyEquivalent: "")
+        n1.isEnabled = false; srcMenu.addItem(n1)
+        srcMenu.addItem(.separator())
+        for (i, t) in Self.tempSources.enumerated() {
+            let mi = NSMenuItem(title: "\(t.name)   ·  \(t.hint)",
+                                action: #selector(setTempSource(_:)), keyEquivalent: "")
+            mi.target = self; mi.tag = i
+            srcMenu.addItem(mi); srcItems.append(mi)
+        }
+        srcItem.submenu = srcMenu
+        m.addItem(srcItem)
+        _ = dynItem(1)     // 紧急判据口径（只读，不做隐藏行为）
         m.addItem(.separator())
 
         let floorItem = NSMenuItem(title: "转速下限", action: nil, keyEquivalent: "")
@@ -414,7 +442,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         // 风扇数变了才重建骨架（正常永不发生，但别假设）
-        let need = 9 + s.fans.count * 3
+        let need = 10 + s.fans.count * 3
         if !menuBuilt || dyn.count != need { buildMenuSkeleton(fanCount: s.fans.count) }
         guard dyn.count == need else { return }
 
@@ -432,17 +460,18 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let age = Int(Date().timeIntervalSince1970 - s.ts)
         set("⚠️ 状态已陈旧 \(age) 秒 —— 守护可能已卡住", hidden: s.isFresh)
 
-        // 标注哪个口径在起作用：控制与紧急判据现在**同口径**（temp_source 决定）
-        let isAvg = (s.config.temp_source == "average")
-        let tag = " · 控制 + 紧急判据"
-        set(String(format: "最热核心   %.1f °C   (%d 个传感器取最大%@)",
-                   s.temp_hottest_c, s.sensors, isAvg ? "" : tag))
-        if let a = s.temp_average_c {
-            set(String(format: "全核平均   %.1f °C   (%d 个传感器%@)",
-                       a, s.sensors, isAvg ? tag : ""))
-        } else {
-            set("全核平均   —（守护版本较旧）", hidden: true)
+        // 三个口径都列出来，并标注当前哪个在驱动曲线（★）与紧急判据（!）
+        let src = s.config.temp_source ?? "max"
+        let esrc = s.config.emergency_source ?? "max"
+        func mark(_ k: String) -> String {
+            var t = ""
+            if k == src  { t += "  ★曲线" }
+            if k == esrc { t += "  !紧急" }
+            return t
         }
+        set(String(format: "最高核心   %.1f °C%@", s.temp_hottest_c, mark("max")))
+        set(String(format: "全核平均   %.1f °C%@", s.temp_average_c ?? -1, mark("average")))
+        set(String(format: "最低核心   %.1f °C%@", s.temp_coolest_c ?? -1, mark("min")))
         set(String(format: "平滑后     %.1f °C   (EMA %.0fs，喂给曲线的就是这个)",
                    s.temp_smoothed_c, s.config.ema_seconds))
 
@@ -467,11 +496,23 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         set(dOn ? "风扇控制守护：开机自启 ✓（系统级，始终开启）"
                 : "⚠️ 风扇控制守护未安装开机自启 —— 重启后风扇将交还固件")
 
+        // 紧急判据口径（只读行）—— 它独立于温度口径，必须显式显示，不做隐藏行为
+        let en = Self.tempSources.first { $0.key == esrc }?.name ?? esrc
+        set("90°C 紧急判据用：\(en)（独立设置，不随上方口径变化）")
+
         // 勾选当前生效的下限（读的是守护报告的**生效值**，不是我们以为写进去的值）
         for mi in floorItems {
             mi.state = (abs(Double(mi.tag) - s.config.min_rpm) < 1) ? .on : .off
         }
+        for mi in srcItems {
+            mi.state = (Self.tempSources[mi.tag].key == src) ? .on : .off
+        }
         refreshLoginItem()
+    }
+
+    @objc private func setTempSource(_ sender: NSMenuItem) {
+        guard Self.tempSources.indices.contains(sender.tag) else { return }
+        writeConfigKey("temp_source", Self.tempSources[sender.tag].key)
     }
 
     /// 自启勾选状态。判**当前事实**（plist 是否存在），不判「我点过开关」。
@@ -497,7 +538,6 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         refreshLoginItem()
     }
-
 
     // 菜单即将打开时立刻刷一次，避免展示上一个 tick 的旧值
     func menuWillOpen(_ menu: NSMenu) { refresh() }

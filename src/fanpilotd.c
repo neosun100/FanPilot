@@ -173,17 +173,18 @@ static int enum_sensors(void){
 // 一次读完 Tp* 簇，同时给出**最热值**与**全核平均值**。
 // 控制输入由 cfg.temp_source 选（使用者选定默认平均）；
 // 但紧急判定固定用最热值 —— 见 fanlogic.h 的 fl_is_emergency。
-static int read_temps(double *hottest, double *average){
-    double hot = -1e9, sum = 0; int got = 0;
+static int read_temps(double *hottest, double *average, double *coolest){
+    double hot = -1e9, cool = 1e9, sum = 0; int got = 0;
     for (int i = 0; i < g_ntemp; i++) {
         double v;
         if (key_read_flt(&g_temp[i], &v) == 0 && v > -5 && v < 150) {
-            if (v > hot) hot = v;
+            if (v > hot)  hot  = v;
+            if (v < cool) cool = v;
             sum += v; got++;
         }
     }
     if (!got) return -1;
-    *hottest = hot; *average = sum / got; return 0;
+    *hottest = hot; *average = sum / got; *coolest = cool; return 0;
 }
 
 static void fans_to_firmware(void){
@@ -196,6 +197,14 @@ static void on_signal(int sig){
 }
 
 // ───────────────────────── 配置 ─────────────────────────
+
+// 口径名 → 枚举。无法识别时退回 0(max) —— 保守方向
+static int parse_src(const char *v){
+    if (!strcmp(v,"average") || !strcmp(v,"avg") || !strcmp(v,"1")) return 1;
+    if (!strcmp(v,"min")     || !strcmp(v,"coolest") || !strcmp(v,"2")) return 2;
+    return 0;   // max
+}
+static const char *src_name(int s){ return s==1?"average":(s==2?"min":"max"); }
 
 static void parse_curve(fl_cfg *c, char *v){
     c->n_curve = 0;
@@ -232,8 +241,8 @@ static void cfg_load(const char *path, fl_cfg *c){
             else if (!strcmp(k,"deadband"))        c->deadband       = atof(v);
             else if (!strcmp(k,"emergency_temp"))  c->emergency_temp = atof(v);
             else if (!strcmp(k,"curve_autoscale")) c->curve_autoscale= atoi(v);
-            else if (!strcmp(k,"temp_source"))     c->temp_source     =
-                     (!strcmp(v,"average") || !strcmp(v,"1")) ? 1 : 0;
+            else if (!strcmp(k,"temp_source"))      c->temp_source      = parse_src(v);
+            else if (!strcmp(k,"emergency_source")) c->emergency_source = parse_src(v);
             else if (!strcmp(k,"curve"))           parse_curve(c, v);
         }
         fclose(fp);
@@ -266,7 +275,7 @@ static void log_effective(void){
     }
 }
 
-static void write_status(const char *path, double hot, double avg, double ema,
+static void write_status(const char *path, double hot, double avg, double cool, double ema,
                         double ac[], double tg[], const char *mode, const int fault[]){
     char tmp[512]; snprintf(tmp, sizeof tmp, "%s.tmp", path);
     FILE *fp = fopen(tmp, "w");
@@ -276,18 +285,19 @@ static void write_status(const char *path, double hot, double avg, double ema,
     //    —— 实测踩过：min_rpm 被解析成 20009，因为注释里有 "kill -9"）。
     fprintf(fp,
       "{\n  \"ts\": %ld,\n  \"mode\": \"%s\",\n"
-      "  \"temp_hottest_c\": %.2f,\n  \"temp_average_c\": %.2f,\n  \"temp_smoothed_c\": %.2f,\n"
+      "  \"temp_hottest_c\": %.2f,\n  \"temp_average_c\": %.2f,\n"
+      "  \"temp_coolest_c\": %.2f,\n  \"temp_smoothed_c\": %.2f,\n"
       "  \"sensors\": %d,\n  \"writes_total\": %ld,\n"
       "  \"config\": {\"min_rpm\": %.0f, \"max_rpm\": %.0f, \"poll_interval\": %.2f,"
       " \"ema_seconds\": %.1f, \"slew_up\": %.0f, \"slew_down\": %.0f,"
       " \"deadband\": %.0f, \"emergency_temp\": %.0f, \"curve_autoscale\": %d,"
-      " \"temp_source\": \"%s\"},\n"
+      " \"temp_source\": \"%s\", \"emergency_source\": \"%s\"},\n"
       "  \"fans\": [\n",
-      (long)time(NULL), mode, hot, avg, ema, g_ntemp, g_writes,
+      (long)time(NULL), mode, hot, avg, cool, ema, g_ntemp, g_writes,
       g_cfg.min_rpm, g_cfg.max_rpm, g_cfg.poll_interval,
       g_cfg.ema_seconds, g_cfg.slew_up, g_cfg.slew_down, g_cfg.deadband,
       g_cfg.emergency_temp, g_cfg.curve_autoscale,
-      g_cfg.temp_source == 1 ? "average" : "max");
+      src_name(g_cfg.temp_source), src_name(g_cfg.emergency_source));
     for (int f = 0; f < NFAN; f++)
         fprintf(fp, "    {\"id\": %d, \"actual_rpm\": %.0f, \"target_rpm\": %.0f,"
                     " \"min\": %.0f, \"max\": %.0f, \"fault\": %s}%s\n",
@@ -426,24 +436,24 @@ int main(int argc, char **argv){
 
         double alpha = g_cfg.poll_interval / g_cfg.ema_seconds;
 
-        double hot, avg;
-        if (read_temps(&hot, &avg) != 0) {
+        double hot, avg, cool;
+        if (read_temps(&hot, &avg, &cool) != 0) {
             // S5 降级留痕：读不到温度就交还固件，绝不用陈旧值继续控制
             fprintf(stderr, "⚠️ 传感器读取失败 → 交还固件自动控制\n");
             fans_to_firmware();
             double z[NFAN] = {0,0};
             int nofault[NFAN] = {0,0};
-            write_status(status_path, -1, -1, -1, z, z, "failsafe_sensor_read_failed", nofault);
+            write_status(status_path, -1, -1, -1, -1, z, z, "failsafe_sensor_read_failed", nofault);
             sleep(5);
             continue;
         }
 
         // 控制输入按配置选（默认全核平均）；平滑只作用在控制输入上
-        double ctl = fl_control_temp(&g_cfg, hot, avg);
+        double ctl = fl_control_temp(&g_cfg, hot, avg, cool);
         g_ema = fl_ema(g_ema, ctl, alpha);
         // 紧急判定与曲线同口径（temp_source 决定），且用**原始值**不用平滑值 ——
         // 平滑会让紧急介入迟到 EMA 一个时间常数。
-        int emergency = fl_is_emergency(&g_cfg, hot, avg);
+        int emergency = fl_is_emergency(&g_cfg, hot, avg, cool);
 
         double ac[NFAN], tg[NFAN];
         for (int f = 0; f < NFAN; f++) {
@@ -481,7 +491,7 @@ int main(int argc, char **argv){
 
         int faults[NFAN];
         for (int f = 0; f < NFAN; f++) faults[f] = g_fs[f].fault;
-        write_status(status_path, hot, avg, g_ema, ac, tg,
+        write_status(status_path, hot, avg, cool, g_ema, ac, tg,
                      emergency ? "emergency" : "normal", faults);
         if (oneshot) break;
         usleep((useconds_t)(g_cfg.poll_interval * 1e6));
@@ -492,7 +502,7 @@ int main(int argc, char **argv){
     fans_to_firmware();
     double z[NFAN] = {0,0};
     int nf2[NFAN] = {0,0};
-    write_status(status_path, -1, -1, -1, z, z, "stopped_firmware_auto", nf2);
+    write_status(status_path, -1, -1, -1, -1, z, z, "stopped_firmware_auto", nf2);
     if (g_conn) IOServiceClose(g_conn);
     return 0;
 }

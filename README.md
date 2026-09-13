@@ -11,7 +11,7 @@
 
 <p align="center">
   <img alt="platform" src="https://img.shields.io/badge/macOS-13%2B%20·%20Apple%20Silicon-0F4C75"/>
-  <img alt="tests" src="https://img.shields.io/badge/tests-133%20passing-3AAFA9"/>
+  <img alt="tests" src="https://img.shields.io/badge/tests-145%20passing-3AAFA9"/>
   <img alt="license" src="https://img.shields.io/badge/license-MIT-blue"/>
 </p>
 
@@ -47,7 +47,7 @@ FanPilot 依赖 SMC 的 `F*Tg` 键可写、`FNum` 可读、`Tp*` 传感器存在
 所以**先确认你的机器支不支持，再装东西**——不要先装一个 root 守护、然后才发现不兼容。
 
 ```bash
-tar -xzf FanPilot-1.0.1.tar.gz && cd FanPilot-1.0.0
+tar -xzf FanPilot-1.1.0.tar.gz && cd FanPilot-1.0.0
 bash install/precheck.sh
 ```
 
@@ -69,10 +69,10 @@ bash install/precheck.sh
 
 ### 方式 A：用安装包（推荐）
 
-从 [Releases](https://github.com/neosun100/FanPilot/releases/latest) 下载 `FanPilot-1.0.1.tar.gz`：
+从 [Releases](https://github.com/neosun100/FanPilot/releases/latest) 下载 `FanPilot-1.1.0.tar.gz`：
 
 ```bash
-tar -xzf FanPilot-1.0.1.tar.gz
+tar -xzf FanPilot-1.1.0.tar.gz
 cd FanPilot-1.0.0
 bash install.sh
 ```
@@ -113,7 +113,7 @@ make app                        # 编译菜单栏 App（需要 Swift 6+）
 bash install/install-app.sh     # 装 App + 开机自启（不需要 sudo）
 ```
 
-跑一遍全部测试（可选，133 项）：`make test`
+跑一遍全部测试（可选，145 项）：`make test`
 
 ### 装了什么、装在哪
 
@@ -204,6 +204,44 @@ App 是 `LSUIElement`（不进 Dock），只在菜单栏。若菜单栏项太多
 > 下限只决定**空闲时的地板转速**，不改变高温时的散热能力——曲线永远铺到硬件上限。
 > 真实的取舍是「空闲噪音 ↔ 温度基线」。
 
+### 温度口径（三档，菜单栏可切）
+
+23 个核心传感器要归成一个数喂给曲线。用哪个数是可选的：
+
+| 档 | 相对最高核 | 手感 |
+|---|---|---|
+| **最高核心温度** | — | 最保守，风扇最早升速 |
+| **全核平均温度** | 低约 3~13 °C | 默认，性能核与能效核折中 |
+| **最低核心温度** | 低约 20~25 °C | 最安静，风扇最晚升速 |
+
+温差之所以这么大，是因为两个核簇差距悬殊：实测**性能核 72~84 °C，能效核只有 58~62 °C**。
+
+面板里三个温度**同时列出**，并标出谁在驱动曲线（★）、谁在管紧急判据（!）：
+
+```
+最高核心    82.5 °C
+全核平均    71.9 °C  !紧急
+最低核心    60.8 °C  ★曲线
+平滑后      58.9 °C   (EMA 15s，喂给曲线的就是这个)
+90°C 紧急判据用：全核平均温度（独立设置，不随上方口径变化）
+```
+
+> 🔴 **紧急判据用独立设置 `emergency_source`，不跟随温度口径。**
+> 若它也用「最低核」，实测意味着**最高核 110 °C、平均 95 °C 时仍不触发**
+> —— 那不是保护被削弱，是等于关掉。所以两个口径分开，并在菜单里显式显示，不做隐藏行为。
+> 想让它跟随，改 `emergency_source` 即可。
+> ⚠️ 无论怎么设，macOS/SoC 自身的硬件过热保护始终生效。
+
+### 温度读数可信吗？
+
+验过。`SMC` 类型是 `flt`（IEEE-754），手工核对过字节级解码；与第三方 App 独立实现交叉验证；
+并用物理反证排除了华氏度（若空闲期的 34 是华氏 = 1.1 °C，比室温低 35 度，不可能）。
+完整四项验证见 [`docs/SMC-RESEARCH.md` §3.1](docs/SMC-RESEARCH.md)。
+
+> 顺带一个会让人困惑的现象：其它温度 App 可能显示比我们**低约 10 °C**。
+> 那不是单位错，而是它们把多个键（含风扇区等偏凉的传感器）**混合并平滑**后显示。
+> 两个数都对，口径不同；混合平滑值低于真实结温，不适合当控制输入。
+
 ---
 
 ## 架构
@@ -257,12 +295,12 @@ App 是 `LSUIElement`（不进 Dock），只在菜单栏。若菜单栏项太多
 ## 测试
 
 ```bash
-make test     # 单元 81 + 验收 25 + E2E/回归 27 = 133 项
+make test     # 单元 93 + 验收 25 + E2E/回归 27 = 145 项
 ```
 
 | 层 | 内容 |
 |---|---|
-| `tests/unit_logic.c` | **81 项** —— `fanlogic.h` 全部纯逻辑：正常路径 + 边界 + 退化输入（0 / 负 / 除零 / NaN） |
+| `tests/unit_logic.c` | **93 项** —— `fanlogic.h` 全部纯逻辑：正常路径 + 边界 + 退化输入（0 / 负 / 除零 / NaN） |
 | `install/verify.sh` | **25 项** —— 运行状态、失效安全断言、资源预算、反向断言 |
 | `tests/e2e.sh` | **27 项** —— 完整用户路径 + **10 条按真实 bug 编号的回归**（R1~R10） |
 

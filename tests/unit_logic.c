@@ -154,44 +154,46 @@ static void test_curve_rescale(void){
 
 // ═══════════════════════════════════════════════════════════════════
 static void test_temp_source(void){
-    group("fl_control_temp / fl_is_emergency —— 控制输入与紧急判据同口径（temp_source 决定）");
+    group("温度口径三档 —— 曲线口径可切(max/average/min)，紧急判据用独立设置");
     fl_cfg c; fl_cfg_defaults(&c);
 
-    ok(c.temp_source == 1, "默认 temp_source = 1（全核平均，使用者选定）");
 
-    // 用本机实测的真实温差：性能核最热 84.3，全核平均 72.6（差 11.7）
-    double hot = 84.3, avg = 72.6;
-    c.temp_source = 1;
-    eqd(fl_control_temp(&c, hot, avg), avg, 0.001, "temp_source=average ⇒ 控制输入取平均 72.6");
-    c.temp_source = 0;
-    eqd(fl_control_temp(&c, hot, avg), hot, 0.001, "temp_source=max ⇒ 控制输入取最热 84.3");
 
-    // 📌 断言口径已于 2026-09-14 按使用者决定变更（原断言「紧急固定看最热核」
-    //    按新设计**已不成立**，故改写而非删除 —— 删掉安全断言而不留痕是最坏做法）。
-    //    新设计：紧急判据与曲线同口径，由 temp_source 决定。
+    // 三档口径（本机实测量级：最高 82.2 / 平均 72.6 / 最低 58.2，最高-最低 ≈ 24°C）
+    double hi = 82.2, av = 72.6, lo = 58.2;
+    eqd(fl_pick_temp(0, hi, av, lo), hi, 0.001, "口径 max  → 最高核 82.2");
+    eqd(fl_pick_temp(1, hi, av, lo), av, 0.001, "口径 average → 全核平均 72.6");
+    eqd(fl_pick_temp(2, hi, av, lo), lo, 0.001, "口径 min  → 最低核 58.2");
+    eqd(fl_pick_temp(99, hi, av, lo), hi, 0.001, "未知口径 → 退回 max（保守方向）");
+
+    fl_cfg_defaults(&c);
+    for (int sc = 0; sc <= 2; sc++) {
+        c.temp_source = sc;
+        eqd(fl_control_temp(&c, hi, av, lo), fl_pick_temp(sc, hi, av, lo), 0.001,
+            sc==0?"曲线口径 max 生效":(sc==1?"曲线口径 average 生效":"曲线口径 min 生效"));
+    }
+
+    // 🔴 核心安全断言：紧急判据用**独立**的 emergency_source，不跟随 temp_source
     fl_cfg_defaults(&c); c.emergency_temp = 90;
+    c.temp_source = 2;            // 曲线看最低核（使用者选定）
+    c.emergency_source = 1;       // 紧急仍看平均（默认，独立）
+    ok(!fl_is_emergency(&c, 95.0, 85.0, 62.0),
+       "曲线=min 时：平均 85 < 90 ⇒ 不触发（紧急看的是平均，不是最低核 62）");
+    ok( fl_is_emergency(&c, 99.0, 90.0, 66.0),
+       "曲线=min 时：平均升到 90 ⇒ 触发（证明紧急没跟着 min 走）");
 
-    c.temp_source = 0;    // max 口径
-    ok(!fl_is_emergency(&c, 89.9, 70.0), "max口径: 最热 89.9 ⇒ 不触发");
-    ok( fl_is_emergency(&c, 90.0, 70.0), "max口径: 最热 90.0 ⇒ 触发（不看平均）");
+    // ⭐ 为什么必须拆开：若紧急也用 min，实测温差 ~24°C ⇒ 保护等于关掉
+    c.emergency_source = 2;
+    ok(!fl_is_emergency(&c, 110.0, 95.0, 89.0),
+       "⚠️[量化] 若紧急也用 min：最高核 110°C、平均 95°C 时**仍不触发**"
+       " —— 这就是把两个口径拆开的理由");
+    c.emergency_source = 0;
+    ok( fl_is_emergency(&c, 110.0, 95.0, 89.0), "同一输入下 emergency_source=max 会触发");
 
-    c.temp_source = 1;    // average 口径（当前默认）
-    ok(!fl_is_emergency(&c, 98.0, 89.9), "average口径: 平均 89.9 ⇒ 不触发（最热已 98）");
-    ok( fl_is_emergency(&c, 92.0, 90.0), "average口径: 平均 90.0 ⇒ 触发");
-
-    // ⭐ 把变更的后果**写成可执行的断言**，让它无法被悄悄遗忘：
-    //    实测温差 2.0~7.8°C（高负载曾 11.7°C）⇒ 平均到 90 时最热核约 92~102°C
-    c.temp_source = 1;
-    ok(!fl_is_emergency(&c, 97.8, 90.0 - 7.8),
-       "⚠️[已知后果] average口径下，最热核 97.8°C 而平均 82.2°C 时**不触发** —— "
-       "这是使用者知情后的选择，非缺陷");
-    ok( fl_is_emergency(&c, 97.8, 90.0),
-       "average口径: 平均升到 90 才触发（此时最热核约 97.8）");
-
-    // 切回 max 必须恢复更早介入
-    c.temp_source = 0;
-    ok(fl_is_emergency(&c, 97.8, 82.2),
-       "⭐ temp_source=max 可随时恢复「更早介入」（同一输入下 max 触发、average 不触发）");
+    // 默认值确认
+    fl_cfg_defaults(&c);
+    ok(c.temp_source == 1 && c.emergency_source == 1,
+       "默认：曲线与紧急都用 average（使用者 2026-09-14 的决定）");
 }
 
 // ═══════════════════════════════════════════════════════════════════
