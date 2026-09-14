@@ -55,6 +55,17 @@ struct Status: Decodable {
     var isFresh: Bool { Date().timeIntervalSince1970 - ts < 15 }
 }
 
+/// 按口径名取温度。**权威实现是 `src/fanlogic.h` 的 `fl_pick_temp()`**（守护真正用的那份）；
+/// 这里只为菜单显示「距紧急阈值还差多少」而镜像一份，不参与任何控制决策。
+/// ⚠️ 改 fanlogic.h 的口径语义时，这里也要改。
+func fl_pick(_ key: String, _ s: Status) -> Double {
+    switch key {
+    case "average": return s.temp_average_c ?? s.temp_hottest_c
+    case "min":     return s.temp_coolest_c ?? s.temp_hottest_c
+    default:        return s.temp_hottest_c
+    }
+}
+
 let statusPath = "/var/run/fanpilot.status.json"
 let configPath = "/usr/local/etc/fanpilot/fanpilot.conf"
 
@@ -152,6 +163,9 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var floorItems: [NSMenuItem] = []
     private var loginItem: NSMenuItem?
     private var srcItems: [NSMenuItem] = []
+    /// 上一次刷新实际写了多少行 —— 供 `--dump-menu` 做「槽位数 == 写入数」的机械断言。
+    private var lastSlotWrites = -1
+    private var builtMenu: NSMenu?
     /// 温度口径三档。决定**曲线与菜单栏显示**用哪个温度。
     /// ⚠️ 紧急判据用独立设置 emergency_source，不跟随此项 —— 见 fanlogic.h 的说明。
     static let tempSources: [(key: String, name: String, hint: String)] = [
@@ -349,9 +363,15 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         _ = dynItem()          // 0  模式
         _ = dynItem()          // 1  陈旧告警（平时 isHidden）
         m.addItem(.separator())
-        _ = dynItem()          // 2  最热核心
+        // 🩸 三档温度口径上线时**只加了 set() 没加槽位**，导致从「平滑后」往下
+        //    整体错位一格：风扇标题跑到缩进层、轮询行挂到「开机自动启动」下面、
+        //    最后一行被静默丢弃（`dyn.indices.contains(i)` 把越界写入吃掉了）。
+        //    ⭐ 教训：骨架槽位数与 set() 调用数是**同一个契约的两半**，
+        //       改一边必须改另一边 —— 已加 --dump-menu 做机械断言（见文件末尾）。
+        _ = dynItem()          // 2  最高核心
         _ = dynItem()          // 3  全核平均
-        _ = dynItem()          // 4  平滑后
+        _ = dynItem()          // 4  最低核心
+        _ = dynItem(1)         // 5  平滑后（缩进：它是上面三者之一的派生量）
         m.addItem(.separator())
         for _ in 0..<fanCount {
             _ = dynItem()      // 风扇标题
@@ -389,7 +409,9 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         srcItem.submenu = srcMenu
         m.addItem(srcItem)
-        _ = dynItem(1)     // 紧急判据口径（只读，不做隐藏行为）
+        // ⛔ 这里原有一行「90°C 紧急判据用：XXX」。已删除：紧急判据现在直接标在
+        //    它所监视的那一行温度旁边（`← 紧急判据 ≥90°C`）。同一事实只写一处 ——
+        //    两处并存时，改了一处忘另一处就会出现「菜单自己跟自己矛盾」。
         m.addItem(.separator())
 
         let floorItem = NSMenuItem(title: "转速下限", action: nil, keyEquivalent: "")
@@ -429,8 +451,33 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         m.addItem(.separator())
         add(m, "退出", action: #selector(quit), key: "q")
 
-        item.menu = m
+        builtMenu = m
+        item?.menu = m          // `item?`：--dump-menu 模式下没有状态栏项，不能强解包
         menuBuilt = true
+    }
+
+    /// `--dump-menu`：把整份菜单按真实层级打印出来，并断言「骨架槽位数 == 写入行数」。
+    /// 🩸 为什么必须有：菜单错位一格（平滑后往下全部串行、最后一行被丢弃）
+    ///    靠肉眼看不出来，靠 grep 源码也查不出来 —— 只有**真的把菜单渲染一遍**才暴露。
+    ///    这是「用机械量而不是字面量做判据」的又一例。
+    func dumpMenu() -> Int32 {
+        let s = readStatus()
+        updateMenu(s)
+        func walk(_ m: NSMenu, _ depth: Int) {
+            for it in m.items {
+                if it.isSeparatorItem { print(String(repeating: "  ", count: depth) + "───"); continue }
+                if it.isHidden { continue }
+                let pad = String(repeating: "  ", count: depth + it.indentationLevel)
+                let chk = it.state == .on ? " [✓]" : ""
+                print(pad + it.title + chk)
+                if let sub = it.submenu { walk(sub, depth + 1) }
+            }
+        }
+        guard let m = builtMenu else { print("✗ 菜单未构建"); return 1 }
+        walk(m, 0)
+        let okSlots = (lastSlotWrites == dyn.count)
+        print("\n槽位 \(dyn.count) · 写入 \(lastSlotWrites) · \(okSlots ? "✅ 匹配" : "❌ 不匹配")")
+        return okSlots ? 0 : 1
     }
 
     /// 就地更新（不重建）。dyn 的顺序必须与 buildMenuSkeleton 完全一致。
@@ -452,31 +499,62 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
             i += 1
         }
 
+        let src   = s.config.temp_source ?? "max"
+        let esrc  = s.config.emergency_source ?? "max"
+        let etemp = s.config.emergency_temp ?? 90
+        func srcName(_ k: String) -> String {
+            switch k {
+            case "average": return "全核平均"
+            case "min":     return "最低核心"
+            default:        return "最高核心"
+            }
+        }
+
+        // 第一行说清「现在按什么调速」—— 光写「自适应控制中」等于没说，
+        // 使用者真正要知道的是**哪个温度在驱动风扇**（三档可切，切错了不该看不出来）。
         switch s.mode {
-        case "normal":    set("自适应控制中")
-        case "emergency": set("🔥 紧急全速（温度超阈值）")
+        case "normal":    set("自适应控制中  ·  按「\(srcName(src))」调速")
+        case "emergency": set(String(format: "🔥 紧急全速 —— 「%@」已达 %.0f°C",
+                                     srcName(esrc), etemp))
         default:          set("⚠️ \(s.mode)")
         }
         let age = Int(Date().timeIntervalSince1970 - s.ts)
         set("⚠️ 状态已陈旧 \(age) 秒 —— 守护可能已卡住", hidden: s.isFresh)
 
-        // 三个口径都列出来，并标注当前哪个在驱动曲线（★）与紧急判据（!）
-        let src = s.config.temp_source ?? "max"
-        let esrc = s.config.emergency_source ?? "max"
+        // 三档温度全列出来，并在**它所驱动的那一行**旁边写清它的作用。
+        // 🩸 旧版用 `★曲线` / `!紧急` 两个符号，两个问题：
+        //    ① 符号没有说明，菜单里没有图例 ⇒ 只有作者看得懂；
+        //    ② `！紧急` 读起来像**告警**（"81.9°C！紧急"），实际只是
+        //       「紧急阈值盯的是这一档」—— 把状态说成了事件，是最坏的一类误导。
+        //    ⇒ 改成箭头 + 完整词组，并把阈值和当前余量一起写出来。
         func mark(_ k: String) -> String {
-            var t = ""
-            if k == src  { t += "  ★曲线" }
-            if k == esrc { t += "  !紧急" }
-            return t
+            var parts: [String] = []
+            if k == src  { parts.append("曲线输入") }
+            if k == esrc {
+                let v = fl_pick(k, s)
+                parts.append(v >= etemp
+                    ? String(format: "紧急判据 ≥%.0f°C 已触发", etemp)
+                    : String(format: "紧急判据 ≥%.0f°C（还差 %.1f）", etemp, etemp - v))
+            }
+            return parts.isEmpty ? "" : "   ← " + parts.joined(separator: " · ")
         }
-        set(String(format: "最高核心   %.1f °C%@", s.temp_hottest_c, mark("max")))
+        // 固件自己的温控设定点约 88.8°C（SMC-RESEARCH §3：Tf?6 恒定不变，未直接验证）。
+        // 最高核心超过它就该让使用者看见 —— 否则菜单里摆着 95°C 却毫无提示。
+        let hot = s.temp_hottest_c
+        let hotFlag = hot >= 95 ? "   🔥 很烫"
+                    : hot >= 88.8 ? "   ⚠️ 偏高（固件设定点约 89°C）" : ""
+        set(String(format: "最高核心   %.1f °C%@%@", hot, mark("max"), hotFlag))
         set(String(format: "全核平均   %.1f °C%@", s.temp_average_c ?? -1, mark("average")))
         set(String(format: "最低核心   %.1f °C%@", s.temp_coolest_c ?? -1, mark("min")))
-        set(String(format: "平滑后     %.1f °C   (EMA %.0fs，喂给曲线的就是这个)",
+        // 缩进一级：它是上面某一档的派生量，不是第四个独立温度（旧版平级摆放会让人误以为是）
+        set(String(format: "平滑后 %.1f °C  ·  EMA %.0fs  ·  这个数才进曲线",
                    s.temp_smoothed_c, s.config.ema_seconds))
 
         for f in s.fans {
-            set(String(format: "风扇 %d", f.id))
+            // 用掉多少散热能力 —— 只看 RPM 数字看不出「还有多少余量没用」，
+            // 而这正是三档口径最容易造成误解的地方（选 min 时余量常大量闲置）。
+            let used = f.max > 0 ? f.target_rpm / f.max * 100 : 0
+            set(String(format: "风扇 %d  —— 已用 %.0f%% 散热能力", f.id, used))
             set(String(format: "实际 %.0f RPM  ·  目标 %.0f RPM%@",
                        f.actual_rpm, f.target_rpm,
                        f.fault == true ? "   ⚠️ 疑似故障" : ""))
@@ -496,9 +574,15 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         set(dOn ? "风扇控制守护：开机自启 ✓（系统级，始终开启）"
                 : "⚠️ 风扇控制守护未安装开机自启 —— 重启后风扇将交还固件")
 
-        // 紧急判据口径（只读行）—— 它独立于温度口径，必须显式显示，不做隐藏行为
-        let en = Self.tempSources.first { $0.key == esrc }?.name ?? esrc
-        set("90°C 紧急判据用：\(en)（独立设置，不随上方口径变化）")
+        // 🔴 骨架槽位数 与 set() 调用数 必须严格相等。不等就是有行错位/被丢弃 ——
+        //    而 `set` 里的 `dyn.indices.contains(i)` 会把越界写入**静默吃掉**，
+        //    实测正是这样让菜单错位一格好几天没人发现（降级必须留痕，不许静默通过）。
+        if i != dyn.count {
+            let msg = "🐞 菜单槽位不匹配：骨架 \(dyn.count) 行，写入 \(i) 行"
+            FileHandle.standardError.write((msg + "\n").data(using: .utf8)!)
+            if dyn.indices.contains(0) { dyn[0].title = msg }
+        }
+        lastSlotWrites = i
 
         // 勾选当前生效的下限（读的是守护报告的**生效值**，不是我们以为写进去的值）
         for mi in floorItems {
@@ -607,6 +691,13 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func quit() { NSApp.terminate(nil) }
+}
+
+// --dump-menu：打印整份菜单 + 断言槽位契约。退出码非 0 = 菜单结构坏了。
+if CommandLine.arguments.contains("--dump-menu") {
+    // 必须先持有强引用：NSMenuItem.target 是 weak，临时对象会在语句内就被释放
+    let dumpCtrl = Controller()
+    exit(dumpCtrl.dumpMenu())
 }
 
 // --render-preview <png>：把菜单栏那张图连同状态栏边界一起渲染出来，用于**自己**验证

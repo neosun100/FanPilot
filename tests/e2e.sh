@@ -238,6 +238,44 @@ dup="$(grep -cE '^static (double|int) (curve_eval|clamp_fan)\(' "${ROOT}/src/fan
 [ "${dup}" = "0" ] && ok "守护内无重复的决策逻辑实现（单一来源 fanlogic.h）" \
                    || bad "守护内仍有重复实现 —— 两份都可能被当权威，必然分叉"
 
+grp "回归 R11 —— 菜单槽位错位（骨架槽位数 ≠ set() 调用数）"
+# 真实 bug（2026-09-14）：温度口径加到三档时**只加了 set() 没加骨架槽位**，
+#   导致「平滑后」往下整体串一格：风扇标题跑到缩进层、轮询行挂到「开机自动启动」下面、
+#   最后一行被 `dyn.indices.contains(i)` **静默丢弃**。肉眼与 grep 都查不出来。
+# ⭐ 判据必须是「真的把菜单渲染一遍」，不是 grep 源码数行数
+#   （grep 会命中注释、也数不清 for 循环里的槽位）。
+if [ -x "${APPBIN}" ]; then
+  if dm="$("${APPBIN}" --dump-menu 2>&1)"; then
+    ok "--dump-menu 槽位契约成立（$(printf '%s' "${dm}" | sed -n 's/^槽位 \(.*\)$/\1/p')）"
+  else
+    bad "--dump-menu 报告槽位不匹配 —— 菜单有行错位或被丢弃：$(printf '%s' "${dm}" | tail -1)"
+  fi
+  # 三档温度必须都在菜单里出现，且**恰好一档**被标为曲线输入
+  for L in 最高核心 全核平均 最低核心 平滑后; do
+    printf '%s\n' "${dm}" | grep -q "${L}" \
+      && ok "菜单含「${L}」行" || bad "菜单缺「${L}」行"
+  done
+  nc="$(printf '%s\n' "${dm}" | grep -c '← 曲线输入' || true)"
+  [ "${nc}" = "1" ] && ok "恰好一档被标为「曲线输入」" \
+                    || bad "被标为「曲线输入」的档位有 ${nc} 个（应为 1）"
+  ne="$(printf '%s\n' "${dm}" | grep -c '紧急判据 ≥' || true)"
+  [ "${ne}" = "1" ] && ok "恰好一档被标为「紧急判据」，且带阈值数字" \
+                    || bad "「紧急判据」标记有 ${ne} 处（应为 1）"
+  # 🩸 旧版用 `！紧急` 这种裸符号，读起来像告警（"81.9°C！紧急"）而实际只是口径标注。
+  #    剥注释后判：源码里不得再出现这两个无说明的符号标记。
+  bads="$(nocomment_swift "${ROOT}/app/Sources/FanPilotMenu/main.swift" \
+          | grep -cE '★曲线|!紧急' || true)"
+  [ "${bads}" = "0" ] && ok "无无说明的符号标记（★曲线 / !紧急 已改成完整词组）" \
+                      || bad "仍有 ${bads} 处裸符号标记 —— 没有图例，只有作者看得懂"
+  # 同一事实只写一处：不得再有独立的「紧急判据用：」行与行内标记并存
+  dupe="$(nocomment_swift "${ROOT}/app/Sources/FanPilotMenu/main.swift" \
+          | grep -c '紧急判据用' || true)"
+  [ "${dupe}" = "0" ] && ok "紧急判据只标在它监视的那行温度旁（无重复的独立行）" \
+                      || bad "紧急判据有两处表述 —— 改一处忘另一处就会自相矛盾"
+else
+  skip "菜单栏 App 未构建，跳过 R11"
+fi
+
 echo
 echo "═══════════════════════════════"
 printf '  通过 %d · 失败 %d · 跳过 %d\n' "${PASS}" "${FAIL}" "${SKIP}"
