@@ -38,7 +38,38 @@ CONSOLE_USER_G="$(/usr/bin/stat -f '%Su' /dev/console 2>/dev/null || echo root)"
 
 BACKUP="$(mktemp)"
 cp "${CONF}" "${BACKUP}" 2>/dev/null || true
+
+# 本脚本派生的所有长驻进程 PID。**必须记，否则被信号打断时它们会变成孤儿。**
+SPAWNED=""
+
+# 有界运行：绝不让可能阻塞的守护把测试挂住，并登记 PID 以便清理。
+# 🩸 2026-09-14 实测代价：R4 裸启动一个守护 ⇒ e2e 挂死 ⇒ pkill 脚本后守护孤儿化，
+#    在后台写了 6 小时 SMC。
+run_bounded(){
+  local secs="$1"; shift
+  "$@" >/dev/null 2>&1 &
+  local pid=$! i=0
+  SPAWNED="${SPAWNED} ${pid}"
+  while kill -0 "${pid}" 2>/dev/null; do
+    i=$((i+1))
+    if [ "${i}" -gt $(( secs * 10 )) ]; then
+      kill -TERM "${pid}" 2>/dev/null; sleep 1; kill -KILL "${pid}" 2>/dev/null
+      return 124                                   # 124 = 超时（与 GNU timeout 一致）
+    fi
+    sleep 0.1
+  done
+  wait "${pid}" 2>/dev/null; return $?
+}
+
 restore(){
+  # 🔴 顺序：**先杀派生进程，再恢复配置**。反了的话野守护会读到恢复后的配置继续写 SMC。
+  for p in ${SPAWNED}; do kill -TERM "${p}" 2>/dev/null; done
+  sleep 1
+  for p in ${SPAWNED}; do kill -KILL "${p}" 2>/dev/null; done
+  # 兜底扫描：PID 登记可能遗漏（例如派生后、登记前脚本就被打断）。
+  # 判据用**命令行特征**（--status /tmp/e2e-），绝不会误杀 launchd 管的真守护。
+  pkill -f 'fanpilotd .*--status /tmp/e2e-' 2>/dev/null || true
+
   if [ -s "${BACKUP}" ]; then
     cp "${BACKUP}" "${CONF}"
     chown "${CONSOLE_USER_G}" "${CONF}" 2>/dev/null || true   # 同上：别留下 root 属主
@@ -46,7 +77,9 @@ restore(){
   fi
   rm -f "${BACKUP}" /tmp/e2e-*.conf /tmp/e2e-*.json /tmp/e2e-*.png
 }
-trap restore EXIT
+# 🔴 必须包含 INT/TERM：只写 EXIT 的话，`pkill` 发来的 SIGTERM 会直接干掉 shell，
+#    EXIT trap 根本不执行 ⇒ 子进程全部孤儿化。这正是 2026-09-14 事故的第三层原因。
+trap restore EXIT INT TERM
 
 # 读状态文件里的一个数字字段（不解析配置文件 —— 那份带人写的注释）
 stat_num(){ sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\([0-9.-]*\).*/\1/p" "${STATUS}" | head -1; }
@@ -130,9 +163,30 @@ fi
 
 grp "回归 R4 —— 单实例锁（双实例抢写 SMC）"
 # 真实 bug：前台实例与 launchd 实例同时跑，各自算曲线抢写同一组寄存器，目标互踩且不报错
-"${BIN}" --config "${CONF}" --status /tmp/e2e-dup.json >/dev/null 2>&1
-[ $? = 4 ] && ok "第二个实例被拒（退出码 4）" || bad "第二个实例竟能启动 —— 会抢写 SMC"
-[ "$(pgrep -x fanpilotd | grep -c .)" = "1" ] && ok "实例数恒为 1" || bad "存在多个实例"
+#
+# 🩸🩸 本测试**自己**造成过一次真事故（2026-09-14），三层都错了，逐层修：
+#   ① 前置条件没断言：本测试的语义是「真守护在跑时第二个实例必须被拒」。
+#      真守护没跑时 flock 无人占用 ⇒ 这条命令不是"被拒"而是**成为真守护并阻塞**，
+#      语义完全翻转 —— 从"验证拒绝"变成"制造一个野守护"。
+#   ② 无界运行：它在前台不带超时地跑一个长驻守护 ⇒ 整套 e2e 挂死。
+#   ③ 没有子进程清理：我 pkill 掉 e2e.sh 后，它派生的守护被**孤儿化**（PPID=1），
+#      在后台写了 6 小时 SMC，与 Macs Fan Control 抢寄存器
+#      ⇒ 使用者看到转速在 3300 与 2500 之间来回拉锯，且两边都不报错。
+#
+# ⭐ 通解：**测试若要启动长驻进程，必须同时满足三条** ——
+#    前置条件显式断言 · 有界（用 --oneshot 或超时）· 退出时无条件清理（trap 含信号）。
+if ! pgrep -x fanpilotd >/dev/null 2>&1; then
+  skip "真守护未运行 ⇒ 本测试语义不成立（会变成启动野守护），跳过（这不是失败）"
+else
+  # ⭐ 用 --oneshot 而不是裸启动：它同样在**打开 SMC 之前**争 flock，
+  #    所以照样能验证锁；但即使抢到锁也只跑一个周期就退出 ⇒
+  #    结构上根本不可能挂死或留下孤儿，而不是靠超时去补救。
+  run_bounded 15 "${BIN}" --config "${CONF}" --status /tmp/e2e-dup.json --oneshot
+  rc=$?
+  [ "${rc}" = "4" ] && ok "第二个实例被 flock 拒绝（退出码 4）" \
+                    || bad "第二个实例未被拒（退出码 ${rc}）—— 会抢写 SMC"
+  [ "$(pgrep -x fanpilotd | grep -c .)" = "1" ] && ok "实例数恒为 1" || bad "存在多个实例"
+fi
 
 grp "回归 R5 —— 安全阈值被配置绕过"
 # 真实 bug①：max_rpm 设很低 ⇒ 紧急打满被用户上限挡住
@@ -371,6 +425,60 @@ if [ -x "${DBIN}" ]; then
 else
   skip "守护未构建，跳过 R13"
 fi
+
+grp "回归 R14 —— 测试脚本自己留下孤儿守护（2026-09-14 真事故）"
+# 事故：R4 裸启动一个 fanpilotd（真守护当时已停 ⇒ flock 无人占 ⇒ 它成了真守护并阻塞）；
+#      我 pkill 掉 e2e.sh 后它被孤儿化（PPID=1），在后台写了 6 小时 SMC，
+#      与 Macs Fan Control 抢寄存器 ⇒ 使用者看到转速在 3300/2500 间拉锯，两边都不报错。
+# ⭐ 判据必须验**机制**，不是验"我加了注释"。三条分别对应三层修复。
+nc_e(){ sed 's/[[:space:]]*#.*$//' "${ROOT}/tests/e2e.sh"; }
+
+# 🩸🩸 判据必须**行首锚定**，否则它会匹配到自己这行代码。
+#    实测（就在写这组测试时）：初版用 `grep -c 'trap restore EXIT INT TERM'`，
+#    而这个字面量**就在判据自己这一行里** ⇒ 计数恒 ≥1 ⇒ 把 trap 改回只有 EXIT
+#    之后判据**依然是绿的**。判据匹配判据 = 恒真 = 完全失活。
+#    ⭐ 通解：grep 源码的判据要么行首锚定到**只有真代码才有的形态**，
+#       要么把被搜的区段排除掉。这是本项目第 8 次栽在「判据命中自己」上。
+
+# ① trap 必须含 INT/TERM —— 只有 EXIT 的话 SIGTERM 会直接干掉 shell，trap 不执行
+#    锚 `^trap ` ：真代码在行首，本判据自己以 `[ "$(...` 开头，匹配不到自己
+[ "$(nc_e | grep -cE '^trap restore .*INT.*TERM')" != "0" ] \
+  && ok "trap 覆盖 EXIT/INT/TERM（被 pkill 时也会清理子进程）" \
+  || bad "trap 未覆盖 INT/TERM —— 被 pkill 时子进程会孤儿化"
+
+# ② R4 必须先断言真守护在跑，否则语义翻转成"制造野守护"
+#    锚 `^if ! pgrep` ：同理，本判据自己匹配不到
+[ "$(nc_e | grep -cE '^if ! pgrep -x fanpilotd')" != "0" ] \
+  && ok "R4 有前置条件断言（真守护未跑时跳过而不是制造野守护）" \
+  || bad "R4 缺前置条件断言 —— 真守护没跑时会启动一个野守护"
+
+# ③ 绝不能再有"裸启动守护"——必须走 run_bounded 且带 --oneshot
+[ "$(nc_e | grep -cE '^[[:space:]]*"\$\{BIN\}"[[:space:]]+--config')" = "0" ] \
+  && ok "无任何裸启动守护的调用（都经 run_bounded）" \
+  || bad "仍有裸启动守护的调用 —— 可能挂死并留下孤儿"
+
+# 🔑 活体验证：真的制造一个孤儿，再确认兜底扫描能收掉它。
+#    只验"代码里有 pkill"是不够的 —— 要验它真的杀得掉，且**不误杀真守护**。
+(sleep 300 >/dev/null 2>&1 &
+ exec -a "fanpilotd --config /tmp/x --status /tmp/e2e-orphan-probe.json" sleep 300) \
+  >/dev/null 2>&1 &
+sleep 1
+before="$(pgrep -f 'e2e-orphan-probe' | grep -c . || true)"
+pkill -f 'fanpilotd .*--status /tmp/e2e-' 2>/dev/null || true
+sleep 1
+after="$(pgrep -f 'e2e-orphan-probe' | grep -c . || true)"
+if [ "${before}" -gt 0 ]; then
+  [ "${after}" = "0" ] && ok "⭐活体：造出的孤儿(${before}个)被兜底扫描收掉" \
+                       || bad "⭐活体：孤儿仍在（${after}个）—— 兜底扫描无效"
+else
+  skip "无法造出探针进程（exec -a 不可用），跳过活体验证"
+fi
+# ⭐ 反向：兜底扫描的判据必须**不匹配** launchd 管的真守护命令行
+real_args="/usr/local/sbin/fanpilotd"
+printf '%s\n' "${real_args}" | grep -q -- '--status /tmp/e2e-' \
+  && bad "兜底判据会误杀真守护 —— 命令行特征不够特异" \
+  || ok "⭐反向：兜底判据不匹配真守护（${real_args}）—— 不会误杀"
+pkill -f 'e2e-orphan-probe' 2>/dev/null || true
 
 echo
 echo "═══════════════════════════════"
