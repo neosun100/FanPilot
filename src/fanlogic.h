@@ -24,9 +24,26 @@ typedef struct {
     int    temp_source;        // 曲线+显示口径：0=最热核(max) 1=全核平均(average) 2=最低核(min)
     int    emergency_source;   // 紧急判据口径：同上取值，**独立于 temp_source**
     int    curve_autoscale;    // 1 = 抬高下限时整条曲线跟着重新铺开（默认开）
+    // ── 转速模式 ──────────────────────────────────────────────
+    // 0 = curve（按温度自适应，原有行为）
+    // 1 = fixed（**定死转速**：写一次就不再写，除非被外力改动或触发紧急）
+    //
+    // 🩸 为什么要加这一档（2026-09-14）：本机两天内发生 5 次 PMU 硬件看门狗复位
+    //    （见 NewMac 的 m5-max-soc-watchdog-reboot.md）。唯一有长期无崩溃记录的配置，
+    //    是「把转速钉死、之后基本不再写 SMC」那种（Macs Fan Control 的用法）。
+    //    自适应模式下本守护约 **16 次/分 ≈ 2.3 万次/天** 写 SMC，
+    //    而定死模式稳态写入 **0 次** —— 这是目前唯一能解释「为什么崩溃间隔从
+    //    10 小时缩短到 1~2 小时」的单变量差异。
+    //    ⚠️ 相关 ≠ 因果，根因仍未确定。这一档是**降低暴露面**，不是已证明的修复。
+    int    fan_mode;
+    double fixed_rpm;          // fan_mode=1 时的目标转速
+    int    emergency_override;  // 1 = 定死模式下仍保留 90°C 紧急打满（默认开）
     int    n_curve;
     struct { double t, rpm; } curve[FL_MAX_CURVE];
 } fl_cfg;
+
+#define FL_MODE_CURVE 0
+#define FL_MODE_FIXED 1
 
 static inline void fl_cfg_defaults(fl_cfg *c){
     c->poll_interval = 2.0;
@@ -40,6 +57,9 @@ static inline void fl_cfg_defaults(fl_cfg *c){
     c->temp_source     = 1;    // 曲线+显示：默认全核平均（使用者选定）
     c->emergency_source= 1;    // 紧急判据：默认全核平均（使用者 2026-09-14 的明确决定）
     c->curve_autoscale = 1;
+    c->fan_mode        = FL_MODE_CURVE;
+    c->fixed_rpm       = 3000;   // 与 Macs Fan Control 长期使用的值一致
+    c->emergency_override = 1;   // 定死模式也保留紧急打满：它只在真出事时才写 SMC
     c->n_curve = 5;
     c->curve[0].t=45; c->curve[0].rpm=2000;
     c->curve[1].t=55; c->curve[1].rpm=2600;
@@ -63,6 +83,14 @@ static inline void fl_cfg_clamp(fl_cfg *c){
     if (c->slew_up < 10)        c->slew_up = 10;          // 太小等于升不上去
     if (c->deadband < 0)        c->deadband = 0;
     if (c->deadband > 500)      c->deadband = 500;        // 太大等于不控制
+    // 转速模式：未知取值一律退回 curve（保守方向 —— 自适应至少不会把机器闷住）
+    if (c->fan_mode != FL_MODE_FIXED) c->fan_mode = FL_MODE_CURVE;
+    // fixed_rpm 只做**下限**保护：上限交给 fl_clamp_fan 按各风扇实测 F*Mx 夹。
+    // 🩸 这里不能写死 5349/5777 —— 两个风扇上限不同，且换机型就错（本项目原则：
+    //    上下限、风扇数、传感器全部运行时读取，绝不硬编码）。
+    if (c->fixed_rpm < 1000)    c->fixed_rpm = 1000;      // 低于此值形同不散热
+    if (c->fixed_rpm > 10000)   c->fixed_rpm = 10000;     // 荒谬值截断，实际由硬件上限决定
+    if (c->emergency_override != 0) c->emergency_override = 1;
 }
 
 // ── ⭐ 曲线自适应重铺（curve_autoscale）───────────────────────────
@@ -166,6 +194,25 @@ static inline double fl_curve_eval(const fl_cfg *c, double t){
         }
     }
     return c->curve[c->n_curve-1].rpm;
+}
+
+// ── 本周期的目标转速（未经夹取/限幅）─────────────────────────────
+//
+// 定死模式下**不看温度**：目标恒为 fixed_rpm ⇒ `fl_should_write` 的死区
+// 自然让稳态写入次数降到 **0**（不需要额外的"别写"分支，靠既有机制即可）。
+// ⭐ 这是刻意的：新增行为若能由既有机制自然导出，就不要再加一条特殊路径 ——
+//    特殊路径是后续分叉的种子。
+static inline double fl_target_rpm(const fl_cfg *c, double smoothed_temp){
+    if (c->fan_mode == FL_MODE_FIXED) return c->fixed_rpm;
+    return fl_curve_eval(c, smoothed_temp);
+}
+
+// 定死模式下紧急保护是否生效。
+// 🔴 默认生效：它在正常温度下**一次都不写 SMC**，只在真的超阈值时才动，
+//    所以"降低写入暴露面"与"保留过热保护"并不冲突 —— 没有理由为了前者放弃后者。
+static inline int fl_emergency_active(const fl_cfg *c){
+    if (c->fan_mode == FL_MODE_FIXED) return c->emergency_override != 0;
+    return 1;                                  // 曲线模式永远保留
 }
 
 // ── 夹到该风扇的合法区间。emergency=1 时**忽略用户 max_rpm**，只受硬件上限约束

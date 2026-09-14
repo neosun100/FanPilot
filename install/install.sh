@@ -45,7 +45,22 @@ else
   cat > "${CONF_DST}" <<'CONF'
 # FanPilot 配置（key = value，改完 `sudo killall -HUP fanpilotd` 热加载）
 
+# ═══ 转速模式（菜单栏可切）═══
+fan_mode   = curve       # curve = 按温度自适应 / fixed = **定死转速**
+fixed_rpm  = 3000        # fan_mode=fixed 时的转速（会按各风扇硬件范围夹取）
+emergency_override = 1   # 定死模式下是否仍保留 emergency_temp 打满（1=保留，推荐）
+#
+# 🩸 为什么有 fixed 这一档：本机 2026-09-13~14 两天内发生 5 次 PMU 硬件看门狗
+#    复位（SOCD/iBoot panic）。唯一有长期无崩溃记录的配置，是「把转速钉死、
+#    之后基本不再写 SMC」那种用法。
+#    · curve 模式：约 16 次/分 ≈ 2.3 万次/天 写 SMC
+#    · fixed 模式：首次爬升到位后稳态 **0 次/分**
+#    这是目前唯一能解释「崩溃间隔为何从 10 小时缩短到 1~2 小时」的单变量差异。
+#    ⚠️ 相关不等于因果，根因仍未确定。这一档是**降低暴露面**，不是已证明的修复。
+#    ⇒ fixed 模式下 min_rpm / max_rpm / ema_seconds / 曲线 全部不参与。
+
 poll_interval  = 2.0     # 轮询间隔(秒)。实测 2.0s ⇒ CPU 0.100%
+                         # fixed 模式下可放大（如 10）以进一步减少 SMC **读**取
 min_rpm        = 2000    # 转速下限。⭐ 它本身就是失效安全：守护若被 kill -9,
                          #   风扇保持最后转速，最坏卡在 >=2000（比出厂空闲的 0 转风量还大）
 max_rpm        = 0       # 上限；0 = 用各风扇的硬件上限(F0=5349 / F1=5777)

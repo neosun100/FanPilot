@@ -262,7 +262,10 @@ static void pm_callback(void *refcon, io_service_t svc, natural_t type, void *ar
 ///      正好制造一次没有任何散热需要的噪音。
 static int takeover_fans(const char *why){
     for (int f = 0; f < NFAN; f++) {
-        g_cur_target[f] = fl_clamp_fan(&g_fan_cfg[f], g_fmin[f], g_fmax[f], g_cfg.min_rpm, 0);
+        // 起步目标：定死模式直接用 fixed_rpm（否则会先爬到 min_rpm 再爬到 fixed_rpm，
+        // 白白多一段限幅过程和一批写入 —— 正是定死模式要避免的东西）
+        double start = (g_cfg.fan_mode == FL_MODE_FIXED) ? g_cfg.fixed_rpm : g_cfg.min_rpm;
+        g_cur_target[f] = fl_clamp_fan(&g_fan_cfg[f], g_fmin[f], g_fmax[f], start, 0);
         // 先 md=1 再写 Tg（PLAN §4.2：顺序反了会有「已切手动但目标为0」窗口）
         if (key_write_u8(&g_md[f], 1) != 0) {
             fprintf(stderr, "✗ 无法切手动模式（需要 root）—— %s\n", why);
@@ -338,6 +341,12 @@ static void cfg_load(const char *path, fl_cfg *c){
             else if (!strcmp(k,"curve_autoscale")) c->curve_autoscale= atoi(v);
             else if (!strcmp(k,"temp_source"))      c->temp_source      = parse_src(v);
             else if (!strcmp(k,"emergency_source")) c->emergency_source = parse_src(v);
+            // 转速模式：接受 "fixed"/"curve" 文字，也接受 1/0
+            else if (!strcmp(k,"fan_mode"))
+                c->fan_mode = (!strncmp(v,"fixed",5) || atoi(v) == FL_MODE_FIXED)
+                              ? FL_MODE_FIXED : FL_MODE_CURVE;
+            else if (!strcmp(k,"fixed_rpm"))       c->fixed_rpm      = atof(v);
+            else if (!strcmp(k,"emergency_override")) c->emergency_override = atoi(v);
             else if (!strcmp(k,"curve"))           parse_curve(c, v);
         }
         fclose(fp);
@@ -356,7 +365,21 @@ static void rebuild_fan_curves(void){
 }
 
 static void log_effective(void){
-    fprintf(stderr, "生效配置: 下限%.0f 上限%s 轮询%.1fs EMA%.0fs 限幅+%.0f/-%.0f 死区%.0f 紧急%.0f°C 自适应曲线%s\n",
+    if (g_cfg.fan_mode == FL_MODE_FIXED) {
+        fprintf(stderr, "生效配置: **定死转速 %.0f RPM** 轮询%.1fs 限幅+%.0f/-%.0f 死区%.0f "
+                        "紧急%.0f°C(%s)\n",
+                g_cfg.fixed_rpm, g_cfg.poll_interval,
+                g_cfg.slew_up, g_cfg.slew_down, g_cfg.deadband,
+                g_cfg.emergency_temp, g_cfg.emergency_override ? "保留" : "⚠️已关闭");
+        for (int f = 0; f < NFAN; f++)
+            fprintf(stderr, "  风扇%d 实际写入目标: %.0f RPM（硬件范围 %.0f~%.0f）\n",
+                    f, fl_clamp_fan(&g_fan_cfg[f], g_fmin[f], g_fmax[f], g_cfg.fixed_rpm, 0),
+                    g_fmin[f], g_fmax[f]);
+        // 这一行是定死模式存在的理由，必须在日志里说清，否则没人知道该期待什么
+        fprintf(stderr, "  ⇒ 首次爬升到位后稳态写 SMC **0 次/分**（对比自适应约 16 次/分）\n");
+        return;
+    }
+    fprintf(stderr, "生效配置: 自适应曲线 · 下限%.0f 上限%s 轮询%.1fs EMA%.0fs 限幅+%.0f/-%.0f 死区%.0f 紧急%.0f°C 重铺%s\n",
             g_cfg.min_rpm,
             g_cfg.max_rpm > 0 ? "见配置" : "硬件上限",
             g_cfg.poll_interval, g_cfg.ema_seconds,
@@ -386,13 +409,16 @@ static void write_status(const char *path, double hot, double avg, double cool, 
       "  \"config\": {\"min_rpm\": %.0f, \"max_rpm\": %.0f, \"poll_interval\": %.2f,"
       " \"ema_seconds\": %.1f, \"slew_up\": %.0f, \"slew_down\": %.0f,"
       " \"deadband\": %.0f, \"emergency_temp\": %.0f, \"curve_autoscale\": %d,"
-      " \"temp_source\": \"%s\", \"emergency_source\": \"%s\"},\n"
+      " \"temp_source\": \"%s\", \"emergency_source\": \"%s\","
+      " \"fan_mode\": \"%s\", \"fixed_rpm\": %.0f, \"emergency_override\": %d},\n"
       "  \"fans\": [\n",
       (long)time(NULL), mode, hot, avg, cool, ema, g_ntemp, g_writes,
       g_cfg.min_rpm, g_cfg.max_rpm, g_cfg.poll_interval,
       g_cfg.ema_seconds, g_cfg.slew_up, g_cfg.slew_down, g_cfg.deadband,
       g_cfg.emergency_temp, g_cfg.curve_autoscale,
-      src_name(g_cfg.temp_source), src_name(g_cfg.emergency_source));
+      src_name(g_cfg.temp_source), src_name(g_cfg.emergency_source),
+      g_cfg.fan_mode == FL_MODE_FIXED ? "fixed" : "curve",
+      g_cfg.fixed_rpm, g_cfg.emergency_override);
     for (int f = 0; f < NFAN; f++)
         fprintf(fp, "    {\"id\": %d, \"actual_rpm\": %.0f, \"target_rpm\": %.0f,"
                     " \"min\": %.0f, \"max\": %.0f, \"fault\": %s}%s\n",
@@ -471,6 +497,9 @@ int main(int argc, char **argv){
                 if (key_init(&k, n) == 0) key_read_flt(&k, &g_fmin[f]);
             }
         }
+        printf("fan_mode=%s\nfixed_rpm=%.0f\nemergency_override=%d\n",
+               g_cfg.fan_mode == FL_MODE_FIXED ? "fixed" : "curve",
+               g_cfg.fixed_rpm, g_cfg.emergency_override);
         printf("poll_interval=%.2f\nmin_rpm=%.0f\nmax_rpm=%.0f\nema_seconds=%.1f\n"
                "slew_up=%.0f\nslew_down=%.0f\ndeadband=%.0f\nemergency_temp=%.1f\n"
                "curve_autoscale=%d\ncurve_points=%d\n",
@@ -482,6 +511,11 @@ int main(int argc, char **argv){
             fl_cfg t = g_cfg;
             fl_curve_rescale(&t, mx[f]);
             printf("fan%d_hw_max=%.0f\n", f, mx[f]);
+            // 定死模式也必须报**实际会写进去的值**（按各风扇硬件范围夹过之后），
+            // 否则又是「校验命令显示模板而非生效值」那个老坑（见本函数开头的 🩸）
+            printf("fan%d_effective_target=%.0f\n", f,
+                   fl_clamp_fan(&t, g_fmin[f], mx[f],
+                                t.fan_mode == FL_MODE_FIXED ? t.fixed_rpm : t.min_rpm, 0));
             for (int i = 0; i < t.n_curve; i++)
                 printf("fan%d_curve%d=%.1f:%.0f\n", f, i, t.curve[i].t, t.curve[i].rpm);
         }
@@ -582,12 +616,16 @@ int main(int argc, char **argv){
         g_ema = fl_ema(g_ema, ctl, alpha);
         // 紧急判定与曲线同口径（temp_source 决定），且用**原始值**不用平滑值 ——
         // 平滑会让紧急介入迟到 EMA 一个时间常数。
-        int emergency = fl_is_emergency(&g_cfg, hot, avg, cool);
+        // 定死模式下若把 emergency_override 关掉，这道保护就整个不参与
+        // （降级留痕：关掉是使用者的显式选择，日志在 log_effective() 里已写明）
+        int emergency = fl_emergency_active(&g_cfg)
+                        && fl_is_emergency(&g_cfg, hot, avg, cool);
 
         double ac[NFAN], tg[NFAN];
         for (int f = 0; f < NFAN; f++) {
             const fl_cfg *fc = &g_fan_cfg[f];
-            double want  = emergency ? 1e9 : fl_curve_eval(fc, g_ema);
+            // 定死模式：want 恒为 fixed_rpm ⇒ 首次爬升后死区自然把写入压到 0 次
+            double want  = emergency ? 1e9 : fl_target_rpm(fc, g_ema);
             double target = fl_clamp_fan(fc, g_fmin[f], g_fmax[f], want, emergency);
             target = fl_slew(fc, g_cur_target[f], target, g_cfg.poll_interval, emergency);
             g_cur_target[f] = target;

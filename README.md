@@ -11,7 +11,7 @@
 
 <p align="center">
   <img alt="platform" src="https://img.shields.io/badge/macOS-13%2B%20·%20Apple%20Silicon-0F4C75"/>
-  <img alt="tests" src="https://img.shields.io/badge/tests-163%20passing-3AAFA9"/>
+  <img alt="tests" src="https://img.shields.io/badge/tests-182%20passing-3AAFA9"/>
   <img alt="license" src="https://img.shields.io/badge/license-MIT-blue"/>
 </p>
 
@@ -113,7 +113,7 @@ make app                        # 编译菜单栏 App（需要 Swift 6+）
 bash install/install-app.sh     # 装 App + 开机自启（不需要 sudo）
 ```
 
-跑一遍全部测试（可选，163 项）：`make test`
+跑一遍全部测试（可选，182 项）：`make test`
 
 ### 装了什么、装在哪
 
@@ -205,6 +205,30 @@ App 是 `LSUIElement`（不进 Dock），只在菜单栏。若菜单栏项太多
 
 > 下限只决定**空闲时的地板转速**，不改变高温时的散热能力——曲线永远铺到硬件上限。
 > 真实的取舍是「空闲噪音 ↔ 温度基线」。
+
+### 转速模式（两档，菜单栏可切）
+
+| | 写 SMC 频率 | 散热 |
+|---|---|---|
+| **自适应曲线**（默认） | 约 16 次/分 ≈ 2.3 万次/天 | 随温度连续调 |
+| **定死转速** | 首次爬升后**稳态 0 次** | 恒定，不随温度变 |
+
+单元测试实测 300 个周期（温度大幅波动）：**定死 4 次 vs 自适应 291 次**——写入少 **73 倍**。
+
+> 🩸 **为什么加这一档。** 本机 2026-09-13~14 两天内发生 **5 次 PMU 硬件看门狗复位**
+> （`SOCD report detected: (iBoot panic)` · `wdog,reset_in_1`）。排查后确认：不是过热、
+> 不是 kernel panic、复位前也无任何软件卡顿（2 秒粒度采样，间隔恒定 2010 ms）。
+> 而唯一有长期无崩溃记录的配置，是「把转速钉死、之后基本不再写 SMC」那种用法。
+>
+> ⚠️ **相关不等于因果，根因仍未确定。** 这一档是**降低暴露面**，不是已证明的修复。
+> 如果你的机器也出现无故重启、且 panic 文件里有 `SOCD`，可以试这一档。
+
+定死模式下 `min_rpm` / `max_rpm` / `ema_seconds` / 曲线全部不参与，菜单里那两项会变灰。
+
+**`emergency_temp` 打满仍然保留**（`emergency_override = 1`）——它只在真的超阈值时才写 SMC，
+所以「减少写入」和「保留过热保护」并不冲突，没有理由为前者放弃后者。
+
+---
 
 ### 温度口径（三档，菜单栏可切）
 
@@ -314,7 +338,7 @@ sudo fanpilotd --selftest-pm     # 投喂一条 WillSleep，回读 F*md 是否�
 ## 测试
 
 ```bash
-make test     # 单元 93 + 验收 25 + E2E/回归 45 = 163 项
+make test     # 单元 112 + 验收 25 + E2E/回归 45 = 182 项
 ```
 
 | 层 | 内容 |

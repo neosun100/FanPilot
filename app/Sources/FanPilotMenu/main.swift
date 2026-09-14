@@ -36,6 +36,9 @@ struct ConfigInfo: Decodable {
     let curve_autoscale: Int?
     let temp_source: String?        // "max" | "average" | "min"
     let emergency_source: String?   // 紧急判据口径，**独立**于 temp_source
+    let fan_mode: String?           // "curve" | "fixed"（旧版状态文件没有此字段）
+    let fixed_rpm: Double?
+    let emergency_override: Int?
 }
 
 struct Status: Decodable {
@@ -179,6 +182,10 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     ///   下限只决定「最安静时的地板」。给档位而不给输入框，是拿掉一整类用户错误。
     /// 上界只到 4000：更高的**常驻**转速噪音大且无必要（真要更高，高温段会自动铺上去）。
     static let floorChoices = [1500, 2000, 2500, 3000, 3500, 4000]
+    /// 定死转速可选档位。与「转速下限」用同一组数字是刻意的 ——
+    /// 使用者已经熟悉这些值的噪音手感，不必再学一套。
+    static let fixedChoices = [2000, 2500, 3000, 3500, 4000, 4500]
+    private var modeItems: [NSMenuItem] = []
 
     func applicationDidFinishLaunching(_: Notification) {
         // .accessory = 只在菜单栏出现，不进 Dock、不抢焦点
@@ -395,6 +402,37 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         _ = dynItem(1)     // 守护自启状态（只读）
         m.addItem(.separator())
 
+        // ⭐ 转速模式：自适应曲线 / 定死转速
+        //
+        // 🩸 为什么给「定死」这一档（2026-09-14）：本机两天内 5 次 PMU 硬件看门狗复位。
+        //    自适应模式每分钟写 SMC 约 16 次（≈2.3万次/天），定死模式稳态 **0 次**
+        //    （单元测试实测 300 周期：4 次 vs 291 次）。
+        //    唯一有长期无崩溃记录的配置就是「钉死转速后基本不再写」那种用法。
+        //    ⚠️ 这是降低暴露面，不是已证明的修复 —— 菜单文案里也要这么说，不许暗示已修好。
+        let modeItem = NSMenuItem(title: "转速模式", action: nil, keyEquivalent: "")
+        let modeMenu = NSMenu()
+        for line in ["定死 = 只写一次就不再动 SMC（最保守）",
+                     "自适应 = 按温度连续调，约 16 次/分写 SMC"] {
+            let n = NSMenuItem(title: line, action: nil, keyEquivalent: "")
+            n.isEnabled = false; modeMenu.addItem(n)
+        }
+        modeMenu.addItem(.separator())
+        modeItems.removeAll()
+        let curveMI = NSMenuItem(title: "自适应曲线（按温度）",
+                                 action: #selector(setCurveMode), keyEquivalent: "")
+        curveMI.target = self; curveMI.tag = -1
+        modeMenu.addItem(curveMI); modeItems.append(curveMI)
+        modeMenu.addItem(.separator())
+        for v in Self.fixedChoices {
+            let mi = NSMenuItem(title: "定死 \(v) RPM", action: #selector(setFixedMode(_:)),
+                                keyEquivalent: "")
+            mi.target = self; mi.tag = v
+            modeMenu.addItem(mi); modeItems.append(mi)
+        }
+        modeItem.submenu = modeMenu
+        m.addItem(modeItem)
+        m.addItem(.separator())
+
         // ⭐ 温度口径：三档可切，改完即刻生效（守护监视配置 mtime）
         let srcItem = NSMenuItem(title: "温度口径", action: nil, keyEquivalent: "")
         let srcMenu = NSMenu()
@@ -512,8 +550,13 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         // 第一行说清「现在按什么调速」—— 光写「自适应控制中」等于没说，
         // 使用者真正要知道的是**哪个温度在驱动风扇**（三档可切，切错了不该看不出来）。
+        let isFixed = (s.config.fan_mode ?? "curve") == "fixed"
         switch s.mode {
-        case "normal":    set("自适应控制中  ·  按「\(srcName(src))」调速")
+        case "normal":
+            // 定死模式下写「按温度调速」是错的 —— 它根本不看温度
+            set(isFixed
+                ? String(format: "定死转速 %.0f RPM  ·  稳态不写 SMC", s.config.fixed_rpm ?? 0)
+                : "自适应控制中  ·  按「\(srcName(src))」调速")
         case "emergency": set(String(format: "🔥 紧急全速 —— 「%@」已达 %.0f°C",
                                      srcName(esrc), etemp))
         default:          set("⚠️ \(s.mode)")
@@ -591,6 +634,16 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for mi in srcItems {
             mi.state = (Self.tempSources[mi.tag].key == src) ? .on : .off
         }
+        // 转速模式勾选：tag -1 = 自适应曲线，其余 tag = 定死转速值。
+        // 判**守护报告的生效值**，不判「我点过哪个」。
+        for mi in modeItems {
+            if mi.tag == -1 { mi.state = isFixed ? .off : .on }
+            else { mi.state = (isFixed && abs(Double(mi.tag) - (s.config.fixed_rpm ?? -1)) < 1)
+                              ? .on : .off }
+        }
+        // 定死模式下「转速下限」「温度口径」不参与决策 —— 变灰，避免让人以为改了有用
+        for mi in floorItems { mi.isEnabled = !isFixed }
+        for mi in srcItems   { mi.isEnabled = !isFixed }
         refreshLoginItem()
     }
 
@@ -634,6 +687,19 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let v = sender.tag
         guard v > 0 else { return }
         writeConfigKey("min_rpm", String(v))
+    }
+
+    @objc private func setCurveMode() { writeConfigKey("fan_mode", "curve") }
+
+    /// 定死转速：**必须先写 fixed_rpm 再写 fan_mode**。
+    /// 🩸 顺序反了会有一个窗口：守护已切 fixed 但 fixed_rpm 还是旧值
+    ///    （守护监视 mtime 自动重载，两次写就是两次重载）⇒ 风扇会先跳到旧转速再跳到新的。
+    ///    这与守护启动时「先 md=1 再写 Tg」是同一类顺序陷阱。
+    @objc private func setFixedMode(_ sender: NSMenuItem) {
+        let v = sender.tag
+        guard v > 0 else { return }
+        writeConfigKey("fixed_rpm", String(v))
+        writeConfigKey("fan_mode", "fixed")
     }
 
     /// 就地替换配置里某个 key 的值，保留其余内容（含注释）。

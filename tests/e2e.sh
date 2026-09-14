@@ -50,6 +50,8 @@ trap restore EXIT
 
 # 读状态文件里的一个数字字段（不解析配置文件 —— 那份带人写的注释）
 stat_num(){ sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\([0-9.-]*\).*/\1/p" "${STATUS}" | head -1; }
+# 读字符串字段（如 fan_mode / temp_source）。同样只读**机器写的** JSON，不碰配置文件
+stat_str(){ sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "${STATUS}" | head -1; }
 # 写配置里一个 key（原子写，模拟菜单栏 App 的行为）
 set_key(){
   local k="$1" v="$2" tmp="${CONF}.e2etmp"
@@ -329,6 +331,45 @@ if [ -x "${DBIN}" ]; then
     || bad "接管逻辑未共用 —— 起步与唤醒会各写一份并静默分叉"
 else
   skip "守护未构建，跳过 R12"
+fi
+
+grp "回归 R13 —— 定死转速模式必须真的停止写 SMC"
+# 加这一档的**全部理由**就是把稳态写入压到 0（见 fanlogic.h 的 fan_mode 注释）。
+# ⭐ 判据必须是「writes_total 真的不再增长」，不是「配置里写了 fixed」——
+#   后者只证明我改了配置，不证明行为变了。
+if [ -x "${DBIN}" ]; then
+  # --check-config 是只读的，守护没跑也能验（不占锁、不写 SMC）
+  cc="$("${DBIN}" --check-config 2>/dev/null)"
+  printf '%s\n' "${cc}" | grep -q "^fan_mode=" \
+    && ok "--check-config 报告 fan_mode（可离线核验生效模式）" \
+    || bad "--check-config 未报告 fan_mode"
+  printf '%s\n' "${cc}" | grep -q "^fan0_effective_target=" \
+    && ok "--check-config 报告每风扇**实际会写入**的目标值（不是模板）" \
+    || bad "--check-config 未报告 effective_target —— 又变成只显示模板"
+
+  if pgrep -x fanpilotd >/dev/null 2>&1; then
+    set_key fan_mode fixed; set_key fixed_rpm 3000
+    sleep 8                                    # 等守护按 mtime 自动重载 + 爬升
+    m="$(stat_str fan_mode)"
+    [ "${m}" = "fixed" ] && ok "守护已切到 fixed（状态文件回读）" \
+                         || bad "守护仍报 fan_mode=${m}"
+    w1="$(stat_num writes_total)"; sleep 12; w2="$(stat_num writes_total)"
+    d=$(( ${w2:-0} - ${w1:-0} ))
+    [ "${d}" -le 1 ] && ok "⭐定死模式 12 秒内写 SMC ${d} 次（≈0，这是本档存在的理由）" \
+                     || bad "定死模式仍在写 SMC ${d} 次/12s —— 目标没有真的恒定"
+    # 反向对照：切回曲线后必须重新开始写（否则上面的 0 可能是守护卡死造成的假绿）
+    set_key fan_mode curve
+    sleep 8
+    v1="$(stat_num writes_total)"; sleep 12; v2="$(stat_num writes_total)"
+    dv=$(( ${v2:-0} - ${v1:-0} ))
+    [ "${dv}" -gt "${d}" ] \
+      && ok "⭐反向：切回 curve 后写入恢复（${dv} 次/12s > ${d}）—— 证明上面的 0 不是卡死" \
+      || bad "切回 curve 后写入仍是 ${dv} 次/12s —— 上面的「0 次」可能是守护卡死的假绿"
+  else
+    skip "守护未运行（正在做 SOCD 复位的受控实验），跳过 fixed 模式的活体写入判据"
+  fi
+else
+  skip "守护未构建，跳过 R13"
 fi
 
 echo

@@ -197,6 +197,84 @@ static void test_temp_source(void){
 }
 
 // ═══════════════════════════════════════════════════════════════════
+static void test_fixed_mode(void){
+    group("定死转速模式 fan_mode=fixed —— 目标恒定 ⇒ 稳态写入 0 次");
+
+    fl_cfg c; fl_cfg_defaults(&c);
+    ok(c.fan_mode == FL_MODE_CURVE, "默认仍是自适应曲线（不改变既有行为）");
+    ok(c.emergency_override == 1, "默认保留紧急打满（降低写入 ≠ 放弃过热保护）");
+
+    // 定死模式：目标与温度**完全无关**
+    fl_cfg_defaults(&c); c.fan_mode = FL_MODE_FIXED; c.fixed_rpm = 3000;
+    eqd(fl_target_rpm(&c, 30),  3000, 0.001, "30°C  → 3000（不看温度）");
+    eqd(fl_target_rpm(&c, 60),  3000, 0.001, "60°C  → 3000");
+    eqd(fl_target_rpm(&c, 88),  3000, 0.001, "88°C  → 3000");
+    eqd(fl_target_rpm(&c, 150), 3000, 0.001, "150°C → 3000（极端值也不变）");
+
+    // 反向：曲线模式下 fl_target_rpm 必须仍走曲线（新函数不能吃掉旧行为）
+    fl_cfg d; fl_cfg_defaults(&d); d.curve_autoscale = 0;
+    eqd(fl_target_rpm(&d, 45), fl_curve_eval(&d, 45), 0.001, "⭐反向：curve 模式仍按曲线取值(45°C)");
+    eqd(fl_target_rpm(&d, 75), fl_curve_eval(&d, 75), 0.001, "⭐反向：curve 模式仍按曲线取值(75°C)");
+    ok(fl_target_rpm(&d, 45) != fl_target_rpm(&d, 75), "⭐反向：curve 模式下不同温度给不同转速");
+
+    // 🔑 核心诉求：稳态写入必须为 0（这是加这一档的**全部理由**）
+    fl_cfg_defaults(&c); c.fan_mode = FL_MODE_FIXED; c.fixed_rpm = 3000;
+    fl_cfg_clamp(&c);
+    double cur = HW_MIN, last = -1; int writes = 0, ramp_writes = 0;
+    for (int i = 0; i < 300; i++) {                       // 300 周期 = 10 分钟
+        double want = fl_target_rpm(&c, 55 + (i % 30));   // 温度大幅波动
+        double tgt  = fl_clamp_fan(&c, HW_MIN, HW_MAX0, want, 0);
+        tgt = fl_slew(&c, cur, tgt, c.poll_interval, 0);
+        cur = tgt;
+        if (fl_should_write(&c, last, tgt)) { last = tgt; writes++; if (i < 30) ramp_writes++; }
+    }
+    printf("      300 周期共写 %d 次（其中前 30 周期爬升占 %d 次）\n", writes, ramp_writes);
+    ok(writes == ramp_writes,
+       "⭐定死模式：爬升结束后**再也不写** —— 300 周期内全部写入都发生在爬升段");
+    ok(writes < 15, "爬升段写入次数很少（受限幅+死区约束）");
+
+    // 对照：同样 300 周期的曲线模式必然持续写入
+    fl_cfg e; fl_cfg_defaults(&e); fl_cfg_clamp(&e); fl_curve_rescale(&e, HW_MAX0);
+    cur = HW_MIN; last = -1; int cwrites = 0;
+    for (int i = 0; i < 300; i++) {
+        double want = fl_target_rpm(&e, 55 + (i % 30));
+        double tgt  = fl_clamp_fan(&e, HW_MIN, HW_MAX0, want, 0);
+        tgt = fl_slew(&e, cur, tgt, e.poll_interval, 0);
+        cur = tgt;
+        if (fl_should_write(&e, last, tgt)) { last = tgt; cwrites++; }
+    }
+    printf("      对照：曲线模式同样 300 周期写 %d 次\n", cwrites);
+    ok(cwrites > writes * 3,
+       "⭐量化对照：曲线模式写入次数远多于定死模式（这就是要加这一档的理由）");
+
+    // 紧急保护：默认仍生效，可显式关闭
+    fl_cfg_defaults(&c); c.fan_mode = FL_MODE_FIXED;
+    ok(fl_emergency_active(&c), "定死模式默认**仍有**紧急保护");
+    c.emergency_override = 0;
+    ok(!fl_emergency_active(&c), "显式关闭后紧急保护不生效（使用者的知情选择）");
+    fl_cfg_defaults(&c);                       // 曲线模式
+    c.emergency_override = 0;
+    ok(fl_emergency_active(&c),
+       "🔴 曲线模式下 emergency_override=0 **无效** —— 保护不可被关掉");
+
+    // 夹取：fixed_rpm 越界必须被硬件范围收住，且紧急仍能打满
+    fl_cfg_defaults(&c); c.fan_mode = FL_MODE_FIXED; c.fixed_rpm = 99999;
+    fl_cfg_clamp(&c);
+    eqd(fl_clamp_fan(&c, HW_MIN, HW_MAX0, fl_target_rpm(&c, 50), 0), HW_MAX0, 0.001,
+        "fixed_rpm 过大 → 夹到风扇0 硬件上限 5349");
+    eqd(fl_clamp_fan(&c, HW_MIN, HW_MAX1, fl_target_rpm(&c, 50), 0), HW_MAX1, 0.001,
+        "[回归] 风扇1 夹到它**自己**的上限 5777，不写死同值");
+
+    fl_cfg_defaults(&c); c.fan_mode = FL_MODE_FIXED; c.fixed_rpm = 1;
+    fl_cfg_clamp(&c);
+    eqd(c.fixed_rpm, 1000, 0.001, "fixed_rpm 过小 → 夹到 1000（低于此值形同不散热）");
+
+    // 未知模式值退回 curve（保守方向）
+    fl_cfg_defaults(&c); c.fan_mode = 77; fl_cfg_clamp(&c);
+    ok(c.fan_mode == FL_MODE_CURVE, "未知 fan_mode → 退回 curve（保守：自适应不会闷住机器）");
+}
+
+// ═══════════════════════════════════════════════════════════════════
 static void test_curve_eval(void){
     group("fl_curve_eval —— 分段线性插值");
     fl_cfg c; fl_cfg_defaults(&c); c.curve_autoscale = 0;   // 用原始模板便于对数
@@ -417,6 +495,7 @@ int main(void){
     printf("═══ FanPilot 纯逻辑单元测试 ═══\n");
     test_cfg_clamp();
     test_curve_rescale();
+    test_fixed_mode();
     test_temp_source();
     test_curve_eval();
     test_clamp_fan();
