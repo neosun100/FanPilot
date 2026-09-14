@@ -276,6 +276,61 @@ else
   skip "菜单栏 App 未构建，跳过 R11"
 fi
 
+grp "回归 R12 —— 睡眠时不交还固件（风扇整夜转）"
+# 真实 bug（2026-09-14）：合盖睡眠 44 分钟（Clamshell Sleep · 电池），用户态全程冻结
+#   ⇒ 守护一次 SMC 都没写；而 F*md=1 是**锁存**的、不会自动回退
+#   ⇒ 风扇按合盖前的 3822 RPM 一直转。守护当时**完全没有**电源通知处理。
+# ⭐ 判据必须验「效果」而不是「接线」：--selftest-pm 直接投喂一条
+#   kIOMessageSystemWillSleep，然后**回读 SMC** 看 F*md 是否真变 0。
+#   这样这条最难测的路径不必真让机器睡一次就能反复验证。
+DBIN="${ROOT}/src/fanpilotd"
+if [ -x "${DBIN}" ]; then
+  st="$("${DBIN}" --selftest-pm 2>&1)"; rc=$?
+  kv(){ printf '%s\n' "${st}" | sed -n "s/^$1=//p"; }
+  [ "$(kv pm_registered)" = "1" ] && ok "IORegisterForSystemPower 注册成功（能收到睡眠通知）" \
+                                 || bad "电源通知注册失败 —— 睡眠交接不可能生效"
+  b0="$(kv fan0_md_before)"; a0="$(kv fan0_md_after)"; a1="$(kv fan1_md_after)"
+  [ "${a0}" = "0" ] && [ "${a1}" = "0" ] \
+    && ok "收到 WillSleep 后两风扇 F*md 真变 0（md ${b0}→${a0}，已交还固件）" \
+    || bad "WillSleep 后 F*md 仍是 ${a0}/${a1} —— 风扇会带着手动目标进入睡眠"
+  [ "${rc}" = "0" ] && ok "--selftest-pm 整体 pass（退出码 0）" \
+                    || bad "--selftest-pm 失败：$(printf '%s' "${st}" | sed -n 's/^result=//p')"
+  # 唤醒自愈：在跑的守护必须把 md 写回 1（否则一次自检就把风扇永久交还了）
+  sleep 5
+  m0="$("${FANCTL}" kv 2>/dev/null | sed -n 's/^fan0_mode=//p')"
+  [ "${m0}" = "1" ] && ok "5 秒后守护已重新接管（fan0_mode=1）—— 自检不会留下副作用" \
+                    || bad "守护未重新接管（fan0_mode=${m0}）—— 风扇被永久交还固件"
+  # 剥 C 注释（// 开头整行），并**一律用 grep -c 不用 grep -q**：
+  # 🩸 实测踩过（就在写这组测试时）：`set -o pipefail` 下 `sed X | grep -q PAT`
+  #    在 PAT 命中后 grep 立刻退出 ⇒ sed 收到 SIGPIPE(141) ⇒ **整条管道判为失败**，
+  #    尽管模式明明匹配到了。更阴的是它**位置相关**：靠文件末尾的模式（sed 已写完）
+  #    能通过，靠开头的必然失败 ⇒ 同一条判据对不同符号给出相反结论。
+  #    ⭐ 通则：管道里的判据只能用「数出来再比」，不能用「命中就早退」。
+  cnt_c(){ sed -E 's|^[[:space:]]*//.*$||' "${ROOT}/src/fanpilotd.c" | grep -c "$1" || true; }
+  # 收不到通知就等于没做：usleep 会让电源通知端口无人服务
+  [ "$(cnt_c CFRunLoopRunInMode)" != "0" ] \
+    && ok "主循环用 CFRunLoopRunInMode 等待（通知端口有人服务）" \
+    || bad "主循环仍只用 usleep —— 电源通知收不到，交接代码等于死代码"
+  # 必须应答，否则拖慢系统睡眠 30 秒
+  [ "$(cnt_c IOAllowPowerChange)" != "0" ] \
+    && ok "有 IOAllowPowerChange 应答（不拖慢系统睡眠）" \
+    || bad "缺 IOAllowPowerChange —— 每次睡眠被拖 30 秒超时"
+  # ⛔ 反向断言：风扇控制器永不否决睡眠
+  [ "$(cnt_c IOCancelPowerChange)" = "0" ] \
+    && ok "⭐反向：绝不 IOCancelPowerChange（不阻止机器睡觉）" \
+    || bad "出现 IOCancelPowerChange —— 风扇控制器无权否决睡眠"
+  # 唤醒必须清历史：否则从睡前的高目标限幅下降，等于唤醒瞬间无端吹一阵
+  [ "$(cnt_c 'g_ema = -1')" != "0" ] \
+    && ok "唤醒重新接管时清空 EMA（不按 44 分钟前的陈旧温度定速）" \
+    || bad "唤醒未清 EMA —— 会用睡前的陈旧温度决定转速"
+  # 起步与唤醒必须走同一条接管路径（否则两处会分叉）
+  [ "$(cnt_c 'takeover_fans')" -ge 3 ] \
+    && ok "起步与唤醒共用 takeover_fans（单一来源，不会分叉）" \
+    || bad "接管逻辑未共用 —— 起步与唤醒会各写一份并静默分叉"
+else
+  skip "守护未构建，跳过 R12"
+fi
+
 echo
 echo "═══════════════════════════════"
 printf '  通过 %d · 失败 %d · 跳过 %d\n' "${PASS}" "${FAIL}" "${SKIP}"

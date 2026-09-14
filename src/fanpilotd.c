@@ -14,6 +14,14 @@
 //                         （SMC 实测不会自动回退；风扇保持最后转速，
 //                          配 min_rpm 下限 ⇒ 最坏也比出厂空闲的 0 转风量大）
 //   · 传感器读失败      → 立即交还固件，不用陈旧值继续控制
+//   · **系统睡眠**      → 收到 kIOMessageSystemWillSleep 立刻交还固件；唤醒后重新接管
+//
+// 🩸 最后那条是补的，它曾经**完全不存在**（2026-09-14 实测暴露）：
+//    合盖睡眠 44 分钟（Clamshell Sleep，电池），整个用户态被冻结 ⇒ 守护一次 SMC 都没写，
+//    而 SMC 的 F*md=1 是**锁存**的、不会自动回退 ⇒ 风扇按合盖前的 3822 RPM 一直转。
+//    ⭐ 教训：列失效路径时我把「失效」等同于**进程死掉**，漏了「进程活着但被冻结」。
+//       冻结比死掉更危险 —— 死掉有 KeepAlive 重启接管，冻结让一条陈旧指令
+//       在硬件寄存器里无限期生效，且正好发生在最不该吹风的时候。
 //
 // 编译: clang -O2 -framework IOKit -framework CoreFoundation -o fanpilotd fanpilotd.c
 
@@ -29,6 +37,9 @@
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <IOKit/IOKitLib.h>
+#include <IOKit/IOMessage.h>
+#include <IOKit/pwr_mgt/IOPMLib.h>
+#include <CoreFoundation/CoreFoundation.h>
 
 #include "fanlogic.h"
 
@@ -196,6 +207,90 @@ static void on_signal(int sig){
     g_stop = 1;
 }
 
+// ───────────────────────── 睡眠 / 唤醒交接 ─────────────────────────
+//
+// 为什么必须有（2026-09-14 实测的真 bug，见文件头）：睡眠时进程被冻结，
+// 而 SMC 的手动模式是**锁存**的 ⇒ 没人撤销就等于「合盖前那条转速命令永久生效」。
+//
+// ⭐ 交还固件（md=0）而不是自己把转速写到 0：
+//    睡眠期间我们**根本没有执行机会**，所以必须把控制权交给唯一还在工作的那一方（固件）。
+//    这也复用了已有的 fans_to_firmware() —— 与 SIGTERM/传感器失败同一条兜底路径，
+//    不新增第二种"睡眠专用"语义。
+
+static io_connect_t          g_pm_root     = MACH_PORT_NULL;
+static IONotificationPortRef g_pm_port     = NULL;
+static io_object_t           g_pm_notifier = IO_OBJECT_NULL;
+/// 需要重新接管风扇（睡醒了 / 或睡眠被取消）。主循环下一拍处理。
+static volatile sig_atomic_t g_retake = 0;
+
+/// 「收到某条电源消息该做什么」的纯动作部分，**与 IOKit 应答分离**。
+/// 这样 --selftest-pm 能直接触发它并回读 SMC 验证效果 ——
+/// 否则睡眠路径只能靠"真的睡一次"来测，而那是最不可能被反复执行的测试。
+static void pm_apply(natural_t type){
+    switch (type) {
+    case kIOMessageSystemWillSleep:
+        // 🔴 睡前最后一件事：把风扇还给固件。这一步没有就是本文件头描述的那个 bug。
+        fans_to_firmware();
+        g_retake = 1;              // 万一 HasPoweredOn 丢了，醒来也能自愈
+        break;
+    case kIOMessageSystemWillPowerOn:
+    case kIOMessageSystemHasPoweredOn:
+        g_retake = 1;
+        break;
+    default:
+        break;
+    }
+}
+
+static void pm_callback(void *refcon, io_service_t svc, natural_t type, void *arg){
+    (void)refcon; (void)svc;
+    pm_apply(type);
+    // ⚠️ 这两条消息**必须应答**，否则系统睡眠被拖 30 秒才超时放行。
+    //    本机日志里已经有一个这样的进程（sysmon timed out(30000 ms)），不能再添一个。
+    //    ⛔ 永不 IOCancelPowerChange：风扇控制器没有任何理由否决机器睡觉。
+    if (type == kIOMessageCanSystemSleep || type == kIOMessageSystemWillSleep)
+        IOAllowPowerChange(g_pm_root, (long)arg);
+}
+
+/// 接管风扇：切手动模式 + 把目标落到下限 + **清空所有历史状态**。
+/// 起步与睡醒后走同一条路径（单一来源），返回 0 成功。
+///
+/// 🩸 唤醒后必须清历史状态，否则会出现两种荒谬行为：
+///   ① g_ema 还是睡前的 70°C（已陈旧 44 分钟）⇒ 醒来第一拍按错的温度定转速
+///   ② g_cur_target 还是睡前的 3900 ⇒ 限幅从 3900 往下爬（降 60 RPM/s 要 23 秒），
+///      而此刻风扇实际早已停转 ⇒ 等于**唤醒瞬间先把风扇拉到 3780 再慢慢降**，
+///      正好制造一次没有任何散热需要的噪音。
+static int takeover_fans(const char *why){
+    for (int f = 0; f < NFAN; f++) {
+        g_cur_target[f] = fl_clamp_fan(&g_fan_cfg[f], g_fmin[f], g_fmax[f], g_cfg.min_rpm, 0);
+        // 先 md=1 再写 Tg（PLAN §4.2：顺序反了会有「已切手动但目标为0」窗口）
+        if (key_write_u8(&g_md[f], 1) != 0) {
+            fprintf(stderr, "✗ 无法切手动模式（需要 root）—— %s\n", why);
+            return -1;
+        }
+        key_write_flt(&g_tg[f], g_cur_target[f]);
+        g_last_written[f] = g_cur_target[f];
+        g_writes++;
+        fl_fan_state_init(&g_fs[f]);      // 清故障计数与爬升宽限
+    }
+    g_ema = -1;                            // -1 ⇒ 下一拍直接取实测温度，不从陈旧值慢爬
+    return 0;
+}
+
+/// 注册电源通知。失败**不致命**（降级留痕）：控风扇仍然可用，只是睡眠交接失灵。
+static int pm_register(void){
+    g_pm_root = IORegisterForSystemPower(NULL, &g_pm_port, pm_callback, &g_pm_notifier);
+    if (g_pm_root == MACH_PORT_NULL || g_pm_port == NULL) {
+        fprintf(stderr, "⚠️ 电源通知注册失败 —— 睡眠时将无法交还固件（风扇可能整夜转）\n");
+        g_pm_port = NULL;
+        return -1;
+    }
+    CFRunLoopAddSource(CFRunLoopGetCurrent(),
+                       IONotificationPortGetRunLoopSource(g_pm_port),
+                       kCFRunLoopDefaultMode);
+    return 0;
+}
+
 // ───────────────────────── 配置 ─────────────────────────
 
 // 口径名 → 枚举。无法识别时退回 0(max) —— 保守方向
@@ -313,15 +408,51 @@ static void write_status(const char *path, double hot, double avg, double cool, 
 int main(int argc, char **argv){
     const char *cfg_path    = "/usr/local/etc/fanpilot/fanpilot.conf";
     const char *status_path = "/var/run/fanpilot.status.json";
-    int oneshot = 0, check_only = 0;
+    int oneshot = 0, check_only = 0, selftest_pm = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--config") && i+1 < argc) cfg_path = argv[++i];
         else if (!strcmp(argv[i], "--status") && i+1 < argc) status_path = argv[++i];
         else if (!strcmp(argv[i], "--oneshot")) oneshot = 1;
         else if (!strcmp(argv[i], "--check-config")) check_only = 1;
+        else if (!strcmp(argv[i], "--selftest-pm")) selftest_pm = 1;
     }
 
     cfg_load(cfg_path, &g_cfg);
+
+    // ── --selftest-pm：**不睡机器**地验证睡眠交接真的有效果。
+    //
+    // 🩸 为什么非要这样：睡眠路径是本项目最难测的一条 —— 要真睡一次、且睡着时
+    //    没有任何进程能记录。上一个 bug（风扇整夜转）就是因为这条路径从来没被验证过。
+    //    ⇒ 把「收到消息该做什么」抽成 pm_apply()，这里直接喂给它一条 WillSleep，
+    //       然后**回读 SMC** 看 F*md 是否真变成 0。判效果，不判"我调了函数"。
+    //
+    // ⚠️ 刻意不占 flock：本自检只做一次性的交还写入，不进控制循环，不会与在跑的守护
+    //    抢寄存器。而且守护会在下一拍把 md 写回 1 —— 这个"自愈"本身就是被断言的一环
+    //    （见 tests/e2e.sh R12）。
+    if (selftest_pm) {
+        int reg = pm_register();
+        printf("pm_registered=%d\n", reg == 0 ? 1 : 0);
+        if (smc_open() != 0) { printf("smc_open=0\nresult=fail\n"); return 1; }
+        printf("smc_open=1\n");
+        for (int f = 0; f < NFAN; f++) {
+            char n[8]; snprintf(n,8,"F%dmd",f); key_init(&g_md[f], n);
+        }
+        int before[NFAN], after[NFAN], okall = 1;
+        for (int f = 0; f < NFAN; f++) {
+            if (key_read_u8(&g_md[f], &before[f]) != 0) before[f] = -1;
+            printf("fan%d_md_before=%d\n", f, before[f]);
+        }
+        pm_apply(kIOMessageSystemWillSleep);          // ← 被测的那一条路径
+        for (int f = 0; f < NFAN; f++) {
+            if (key_read_u8(&g_md[f], &after[f]) != 0) after[f] = -1;
+            printf("fan%d_md_after=%d\n", f, after[f]);
+            if (after[f] != 0) okall = 0;             // 必须真的交还给固件
+        }
+        printf("retake_flag=%d\n", g_retake ? 1 : 0);
+        printf("result=%s\n", (okall && reg == 0 && g_retake) ? "pass" : "fail");
+        if (g_conn) IOServiceClose(g_conn);
+        return (okall && reg == 0 && g_retake) ? 0 : 1;
+    }
 
     // --check-config：只加载并打印**生效后**的配置（含每风扇实际曲线）就退出。
     //
@@ -400,18 +531,9 @@ int main(int argc, char **argv){
     log_effective();
 
     signal(SIGTERM, on_signal); signal(SIGINT, on_signal); signal(SIGHUP, on_signal);
+    pm_register();      // 睡眠交接；失败已在内部留痕，不阻止启动
 
-    // 起步：先 md=1 再写 Tg（PLAN §4.2：顺序反了会有「已切手动但目标为0」窗口）
-    for (int f = 0; f < NFAN; f++) {
-        g_cur_target[f] = fl_clamp_fan(&g_fan_cfg[f], g_fmin[f], g_fmax[f], g_cfg.min_rpm, 0);
-        if (key_write_u8(&g_md[f], 1) != 0) {
-            fprintf(stderr, "✗ 无法切手动模式（需要 root）—— 退出\n");
-            return 1;
-        }
-        key_write_flt(&g_tg[f], g_cur_target[f]);
-        g_last_written[f] = g_cur_target[f];
-        g_writes++;
-    }
+    if (takeover_fans("退出") != 0) return 1;
 
     // ⭐ 配置文件自动重载（监视 mtime）。
     //    为什么：菜单栏 App 是**无特权**的，它改完配置没法给 root 守护发 SIGHUP。
@@ -421,6 +543,13 @@ int main(int argc, char **argv){
     time_t cfg_mtime = (stat(cfg_path, &cst) == 0) ? cst.st_mtime : 0;
 
     while (!g_stop) {
+        // 睡醒了（或睡眠被取消）⇒ 重新接管。幂等：多触发一次只是重写一遍手动模式。
+        if (g_retake) {
+            g_retake = 0;
+            fprintf(stderr, "系统唤醒 → 重新接管风扇（已清空 EMA 与限幅历史）\n");
+            takeover_fans("唤醒后重新接管失败");
+        }
+
         int need_reload = g_reload;
         g_reload = 0;
         if (stat(cfg_path, &cst) == 0 && cst.st_mtime != cfg_mtime) {
@@ -494,7 +623,16 @@ int main(int argc, char **argv){
         write_status(status_path, hot, avg, cool, g_ema, ac, tg,
                      emergency ? "emergency" : "normal", faults);
         if (oneshot) break;
-        usleep((useconds_t)(g_cfg.poll_interval * 1e6));
+
+        // 🔴 这里**不能**用 usleep：那样电源通知端口没人服务，
+        //    kIOMessageSystemWillSleep 根本收不到 ⇒ 睡眠交接等于不存在。
+        //    （注册成功才走 run loop；失败时退回 usleep，行为与旧版一致。）
+        // ⚠️ 代价：SIGTERM/SIGHUP 的响应最坏晚一个 poll_interval（2s）才被处理，
+        //    因为 run loop 不会被信号提前唤醒。launchd 的退出宽限远大于此，可接受。
+        if (g_pm_port)
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, g_cfg.poll_interval, false);
+        else
+            usleep((useconds_t)(g_cfg.poll_interval * 1e6));
     }
 
     // 正常退出/SIGTERM：交还固件（SIGKILL 走不到这里，靠 launchd KeepAlive）
