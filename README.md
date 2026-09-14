@@ -354,6 +354,9 @@ make research
       `install/precheck.sh` 可在安装前只读自检，但没有其它机型的真机数据
 - [ ] **`Tf?6` 是否真是固件跳闸点** —— `Tf06`=88.81 / `Tf16`=85.97 恒定不变，
       一致性很强但无直接证据（见 [`docs/SMC-RESEARCH.md`](docs/SMC-RESEARCH.md) §6）
+- [ ] **`fanctl kv` 补齐三档温度** —— 现在只报 `temp_hottest`，缺 average / min /
+      smoothed，且它自己只读 5 个键（守护读 23 个）⇒ 两边的 `temp_hottest` 口径不同。
+      机器可读面应改成直接透传守护的状态 JSON，而不是自己再读一遍 SMC
 
 ---
 
