@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="FanPilot">
+  <title>FanPilot</title>
+
+  <!--
+    macOS app 图标（Big Sur+ 规范）。与 logo.svg 的区别只有一个，但很关键：
+
+    🔴 **必须留白。** 1024×1024 画布里，图标本体只占 **824×824 居中**（四边各留 100px），
+       圆角 **185.4**。logo.svg 是铺满 512×512 + rx=96 —— 直接拿它当 app 图标会让这个
+       图标在 Dock 和 Finder 里**比周围所有图标都大一圈**，且圆角弧度与系统 squircle 不一致。
+       ⇒ 这不是审美问题，是规范问题：macOS 不会替你缩，留白得自己留。
+
+    视觉语言沿用 logo.svg（同一个产品不该有两套形象）：
+      蓝→青渐变 = 表达「降温」这个目的，而不是「发热」这个问题
+      三叶不透明度递增 0.62→0.80→0.96 = 本身就在表达「转速随温度爬升」
+      ⇒ 所以刻意**不再画温度曲线**：多一个图形只会让 16×16 糊掉（初版教训）
+
+    叶型与轮毂的比例直接沿用 logo.svg，用 scale() 换算而不是手改坐标
+    （824/512 = 1.609），避免两份资产的叶型悄悄分叉。
+  -->
+
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%"   style="stop-color:#0F4C75"/>
+      <stop offset="100%" style="stop-color:#3AAFA9"/>
+    </linearGradient>
+    <!-- 极淡的底部阴影，让图标在 Dock 里「坐得住」。
+         macOS 自己的图标都有，缺了会显得漂浮。 -->
+    <filter id="sh" x="-10%" y="-10%" width="120%" height="125%">
+      <feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#000" flood-opacity="0.22"/>
+    </filter>
+  </defs>
+
+  <!-- 图标本体：824×824 居中，圆角 185.4 -->
+  <rect x="100" y="100" width="824" height="824" rx="185.4" fill="url(#bg)" filter="url(#sh)"/>
+
+  <!-- 三叶风扇。scale(1.609) = 824/512，与 logo.svg 同源 -->
+  <g transform="translate(512 512) scale(1.609)">
+    <path d="M0 -152 C60 -132 88 -75 63 -33 C42 2 4 6 -13 -13 C-32 -46 -29 -110 0 -152 Z"
+          fill="#fff" opacity="0.62"/>
+    <path d="M0 -152 C60 -132 88 -75 63 -33 C42 2 4 6 -13 -13 C-32 -46 -29 -110 0 -152 Z"
+          fill="#fff" opacity="0.80" transform="rotate(120)"/>
+    <path d="M0 -152 C60 -132 88 -75 63 -33 C42 2 4 6 -13 -13 C-32 -46 -29 -110 0 -152 Z"
+          fill="#fff" opacity="0.96" transform="rotate(240)"/>
+    <!-- 轮毂半径取得比叶尾内缘更大，否则叶尾会把内点切成三角形（初版就是这么坏的）-->
+    <circle r="44" fill="#fff"/>
+    <circle r="16" fill="#0F4C75" opacity="0.9"/>
+  </g>
+</svg>

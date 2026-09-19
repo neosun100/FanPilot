@@ -31,9 +31,22 @@ sleep 1
 echo "  ✅ 已停"
 
 echo "=== 2. 安装到 ${DST} ==="
+# 图标是可复现产物：源 bundle 里没有就先生成。
+# 🩸 不做这一步的后果：新克隆的仓库装出来 app 图标是**空白**（Resources 空 +
+#    Info.plist 无 CFBundleIconFile）—— 2026-09-19 实测就是这个状态。
+if [ ! -f "${SRC}/Contents/Resources/FanPilot.icns" ]; then
+  if command -v rsvg-convert >/dev/null 2>&1; then
+    echo "  图标缺失，生成中…"
+    bash "${HERE}/../assets/make-icns.sh" || echo "  ⚠️ 图标生成失败，继续装（图标会是空白）"
+  else
+    echo "  ⚠️ 缺 rsvg-convert（brew install librsvg）⇒ 跳过图标生成，图标会是空白"
+  fi
+fi
 rm -rf "${DST}"
 cp -R "${SRC}" "${DST}"
-echo "  ✅ 已复制"
+# 🔴 cp -R 之后必须重签：ad-hoc 签名绑定路径外的内容哈希，复制本身不破签名，
+#    但若上面刚生成过图标，源 bundle 的签名已在 make-icns.sh 里重签过，这里无需再动。
+echo "  ✅ 已复制$([ -f "${DST}/Contents/Resources/FanPilot.icns" ] && echo "（含图标）")"
 
 echo "=== 3. 挂 LaunchAgent（开机自启）==="
 mkdir -p "${HOME}/Library/LaunchAgents"

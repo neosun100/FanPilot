@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="FanPilot">
+  <title>FanPilot (small sizes)</title>
+
+  <!--
+    16/32/64 px 专用变体。**不是** appicon.svg 缩小 —— 那一版在 16px 实测不合格：
+      ① 深色轮毂内点（16px 下约 0.5px）完全消失
+      ② 三片叶子糊成一团白斑，认不出是风扇
+      ③ 0.62/0.80/0.96 的不透明度差在 16px 下无法分辨
+
+    🩸 两次实测淘汰的设计（留档，别重走）：
+      ✗ 三叶负空间 + 中心孔 → 16px 下读成**一张脸**（两只眼 + 一张嘴）。
+        三重对称配中心孔会触发错觉，这是小图标的经典陷阱。
+      ✗ 去掉中心孔的三叶负空间 → **仍然是脸**。问题在三重对称本身，不在中心孔。
+      ✓ **四叶风车 + 无中心孔 + 整体旋转 20°** → 清晰可读为风扇。
+        四重对称不触发面部错觉；旋转 20° 避免读成十字/加号。
+
+    手法：先铺白色实心圆盘，再用 mask 切出 4 道楔形缺口。
+    同样墨量下「大块白 + 清晰缺口」比「细白形状」可辨得多。
+    Apple 自己的图标也是按尺寸档分别做美术，不是一套缩到底。
+
+    与大图标保持同一形象语言：同一蓝→青渐变、同为居中旋翼、同样遵守 824 留白规范。
+  -->
+
+  <defs>
+    <linearGradient id="bgs" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%"   style="stop-color:#0F4C75"/>
+      <stop offset="100%" style="stop-color:#3AAFA9"/>
+    </linearGradient>
+
+    <mask id="cut">
+      <rect x="0" y="0" width="1024" height="1024" fill="#000"/>
+      <circle cx="512" cy="512" r="300" fill="#fff"/>
+      <!-- rotate(20)：避免四叶读成十字/加号 -->
+      <g transform="translate(512 512) rotate(20)">
+        <path d="M0 0 L92 -330 A350 350 0 0 0 -92 -330 Z" fill="#000"/>
+        <path d="M0 0 L92 -330 A350 350 0 0 0 -92 -330 Z" fill="#000" transform="rotate(90)"/>
+        <path d="M0 0 L92 -330 A350 350 0 0 0 -92 -330 Z" fill="#000" transform="rotate(180)"/>
+        <path d="M0 0 L92 -330 A350 350 0 0 0 -92 -330 Z" fill="#000" transform="rotate(270)"/>
+      </g>
+    </mask>
+  </defs>
+
+  <rect x="100" y="100" width="824" height="824" rx="185.4" fill="url(#bgs)"/>
+  <circle cx="512" cy="512" r="300" fill="#fff" mask="url(#cut)"/>
+</svg>
