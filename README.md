@@ -40,6 +40,11 @@ FanPilot 接管这件事：读 CPU 核心温度，按一条曲线连续调节两
 ## 安装
 
 > **要求**：Apple Silicon Mac · macOS 13+ · 与其它风扇控制软件**互斥**（两者会抢写 SMC）
+>
+> 📊 **已经在用 Macs Fan Control？** 先看
+> [**21 项实测对照**](docs/COMPARISON-macs-fan-control.md) 再决定换不换 ——
+> 每一行都标了证据来源，也如实写了 **MFC 更好的 5 个地方**（公证签名、机型广度、成熟度…）。
+> 最要紧的一条差别：MFC **不注册电源通知**，合盖睡眠时风扇会按固定值继续转。
 
 ### 第 0 步：先做兼容性预检（只读，什么都不改）
 
@@ -357,6 +362,7 @@ make test     # 单元 112 + 验收 25 + E2E/回归 45 = 182 项
 
 | | |
 |---|---|
+| [`docs/COMPARISON-macs-fan-control.md`](docs/COMPARISON-macs-fan-control.md) | **与 Macs Fan Control 的 21 项实测对照**（每行标注证据来源：实测／源码核实／未验证）。含 MFC 明确更好的 5 个地方 —— 不粉饰 |
 | [`docs/SMC-RESEARCH.md`](docs/SMC-RESEARCH.md) | SMC 逆向调研：键位、可写性判定、传感器筛选方法、全部实测数据 |
 | [`docs/PLAN.md`](docs/PLAN.md) | 设计与开发计划：控制算法、安全红线、资源预算、被推翻的设计 |
 
