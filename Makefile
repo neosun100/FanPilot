@@ -55,7 +55,11 @@ app:
 # 发布包：布局与仓库一致，所以 install/*.sh 无需任何改动即可在解压目录里跑
 VERSION := $(shell cat VERSION)
 DIST    := dist/FanPilot-$(VERSION)
+# 🩸 bundle.sh 每次重建 .app，图标只在 install-app.sh 里补生成 ⇒ 不先生成图标，发布包里 App 图标是空白
+#    （2026-10-28 打 2.0.0 包时实测 Resources/ 为空，与 09-19 修过的同一个问题）。缺图标就拒绝打包。
 dist: all app
+	bash assets/make-icns.sh
+	@test -f app/FanPilot.app/Contents/Resources/FanPilot.icns || { echo "✗ App 图标缺失，拒绝打包"; exit 1; }
 	rm -rf $(DIST) dist/FanPilot-$(VERSION).tar.gz
 	mkdir -p $(DIST)/src $(DIST)/install $(DIST)/app
 	cp src/fanpilotd src/fanctl            $(DIST)/src/
