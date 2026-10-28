@@ -2,6 +2,27 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [2.1.2] — 2026-10-28
+
+这一版的主题：**收尾 —— 口径统一、日志不再无限增长。**
+
+### 修复
+
+- **`fanctl` 的「最热温度」与守护不是一回事**：它手写 5 个键，里面混着 `TCMb` / `TVDP` 两个**非核心**键
+  （实测 `TVDP` 100.48 °C，比所有核心都热）。现在「什么算核心温度」抽成 `fl_is_core_temp_key()`，
+  守护与 `fanctl` 共用；`fanctl kv` 同样枚举全部 `Tp*`（本机 23 个），并新增 `temp_sensors`。单测 +6（含两条回归）
+- **守护日志从不轮转**：一天就涨到 46 KB。安装 `/etc/newsyslog.d/com.newmac.fanpilotd.conf`（1 MB × 3，gzip）；
+  卸载时一并删除；`verify.sh` 用 `newsyslog -nv` 确认配置能被解析
+- Makefile：`fanctl` 也依赖 `fanlogic.h`（与守护那条 🩸 同一个坑：改头文件不重编）
+
+### 杂项
+
+- `research/power.c`（SMC 功率键只读探针）纳入仓库与 `make research`
+- `.gitignore` 补 `.env*` / `*credentials*` / `*secrets*`
+- GitHub 仓库简介仍是 1.x 的「自适应温控 · 132 项测试」⇒ 改为 2.1 的描述与实测数字
+
+全量 **177 / 177**（单元 72 + 验收 31 + E2E 74）。
+
 ## [2.1.1] — 2026-10-28
 
 这一版的主题：**合盖放包里，风扇不会再半夜自己转起来。**

@@ -13,7 +13,7 @@
   <a href="https://github.com/neosun100/FanPilot/releases/latest"><img alt="release" src="https://img.shields.io/github/v/release/neosun100/FanPilot?style=flat-square&color=0F4C75"/></a>
   <img alt="platform" src="https://img.shields.io/badge/macOS-13%2B%20·%20Apple%20Silicon-0F4C75?style=flat-square&logo=apple&logoColor=white"/>
   <img alt="lang" src="https://img.shields.io/badge/C%20%2B%20Swift-零依赖-3AAFA9?style=flat-square"/>
-  <img alt="tests" src="https://img.shields.io/badge/tests-170%20passing-3AAFA9?style=flat-square"/>
+  <img alt="tests" src="https://img.shields.io/badge/tests-177%20passing-3AAFA9?style=flat-square"/>
   <img alt="mutations" src="https://img.shields.io/badge/mutations-10%2F10%20killed-3AAFA9?style=flat-square"/>
   <img alt="smc writes" src="https://img.shields.io/badge/稳态写%20SMC-0%20次-2E7D32?style=flat-square"/>
   <a href="LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square"/></a>
@@ -147,7 +147,7 @@ bash install.sh
 | 2 | 兼容性预检 + 冲突检查，**有阻断项就中止** | ❌ |
 | 3 | 装控制守护 `fanpilotd`（root LaunchDaemon），默认 **50 %** | ✅ |
 | 4 | 装菜单栏 App 到 `/Applications` + 开机自启 | ❌ |
-| 5 | 跑 30 项验收（含「稳态 60 秒写 SMC = 0 次」），全绿才算成功 | ✅ |
+| 5 | 跑 31 项验收（含「稳态 60 秒写 SMC = 0 次」），全绿才算成功 | ✅ |
 
 > **为什么要 sudo**：写 SMC 风扇寄存器需要 root（读不需要）。守护是**全机唯一**能写 SMC 的进程；
 > 菜单栏 App 完全无特权，只读状态文件。这个权限边界是刻意划的，见[架构](#架构)。
@@ -166,7 +166,7 @@ git clone https://github.com/neosun100/FanPilot.git && cd FanPilot
 make                 # 编译守护 fanpilotd 与命令行工具 fanctl（C，无第三方依赖）
 make precheck        # 兼容性预检（只读）
 make install         # 装 root LaunchDaemon（会要 sudo）
-make verify          # 30 项验收，含反向断言
+make verify          # 31 项验收，含反向断言
 
 make app                        # 编译菜单栏 App（需要 Swift 6+）
 bash install/install-app.sh     # 装 App + 开机自启（不需要 sudo）
@@ -194,7 +194,8 @@ emergency_source = average   # 紧急判据：max（最高核心）/ average（�
 | `/Library/LaunchDaemons/com.newmac.fanpilotd.plist` | launchd 配置（`RunAtLoad` + `KeepAlive`，节流 10 s） | root |
 | `/usr/local/etc/fanpilot/fanpilot.conf` | 配置 | **你**（App 要能改） |
 | `/var/run/fanpilot.status.json` | 运行状态（守护写，`0644`） | root 写 / 所有人可读 |
-| `/var/log/fanpilotd.log` | 守护日志（只记边沿事件，不按巡检刷屏） | root |
+| `/var/log/fanpilotd.log` | 守护日志（带时间戳，只记边沿事件，不按巡检刷屏） | root |
+| `/etc/newsyslog.d/com.newmac.fanpilotd.conf` | 日志轮转（1 MB 轮一次，保留 3 份） | root |
 | `/Applications/FanPilot.app` | 菜单栏 App | 你 |
 | `~/Library/LaunchAgents/com.newmac.fanpilot.menu.plist` | App 的开机自启 | 你 |
 
@@ -381,13 +382,13 @@ grep writes_total /var/run/fanpilot.status.json; sleep 60; grep writes_total /va
 ## 测试
 
 ```bash
-make test     # 单元 66 + 验收 30 + E2E/回归 74 = 170 项
+make test     # 单元 72 + 验收 31 + E2E/回归 74 = 177 项
 ```
 
 | 层 | 守什么 | 守不住什么 |
 |---|---|---|
-| `tests/unit_logic.c` · **66** | `fanlogic.h` 全部纯逻辑：配置解析（含 NaN / 垃圾值 / 注释）、硬夹、百分比折算、紧急回差、令牌桶、抢写让步 | IOKit 交互 |
-| `install/verify.sh` · **30** | 装好后的事实：运行状态、失效安全、**稳态 60 秒 0 写入**、资源预算、重启节流、反向断言 | 用户路径 |
+| `tests/unit_logic.c` · **72** | `fanlogic.h` 全部纯逻辑：配置解析（含 NaN / 垃圾值 / 注释）、硬夹、百分比折算、紧急回差、令牌桶、抢写让步 | IOKit 交互 |
+| `install/verify.sh` · **31** | 装好后的事实：运行状态、失效安全、**稳态 60 秒 0 写入**、资源预算、重启节流、反向断言 | 用户路径 |
 | `tests/e2e.sh` · **74** | 真机用户路径 + 按真实 bug 编号的回归，含活体：改档即刻生效、目录噪音不触发重载、原地编辑 ≤ 1 周期生效、被抢写时让步、App 单实例 | 真实合盖（见路线图） |
 
 关键判据都做过**变异验证**：把修过的缺陷改回去（容差 50、桶容量 16、去掉回差、永远重写、去 NaN 防护、紧急不打满、让步失效、不剥注释），
@@ -405,7 +406,6 @@ make test     # 单元 66 + 验收 30 + E2E/回归 74 = 170 项
 - [ ] **真机合盖复验睡眠交接** —— 代码路径已用 `--selftest-pm` 验证（回读 `F*md` 变 0），但真实合盖一次的端到端确认还没做。
       判据：合盖 10 分钟后掀开，`pmset -g log | grep "Entering Sleep"` 有条目 + 全程听不到风扇
 - [ ] **其他机型** —— 只在 Mac17,6（M5 Max）实测过；`precheck.sh` 可在安装前只读自检
-- [ ] **`fanctl kv` 的温度口径与守护不同** —— 它只读 5 个键（守护读 23 个）。机器可读面应改成透传守护的状态 JSON
 - [ ] **下拉面板截图** —— 现在用 `--dump-menu` 的真实文本代替；菜单栏状态图由 App 渲染代码导出。不用模拟图冒充截图
 
 **已确认不做（不要再提）**

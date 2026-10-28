@@ -31,7 +31,7 @@
 
 | # | 维度 | FanPilot 2.0.0 | Macs Fan Control 1.5.21 | 证据 |
 |---|---|---|---|---|
-| 1 | **睡眠交还固件** | ✅ 注册 `IORegisterForSystemPower`，`kIOMessageSystemWillSleep` 时写 `F*md=0` | 🔴 **无**。主二进制、特权 helper、全部 Qt 框架**均未导入任何电源管理符号**，只导入 `IOServiceOpen` + `IOConnectCallStructMethod` | 📄 `dyld_info -imports`（方法已过正对照，见 §4）|
+| 1 | **睡眠交还固件** | ✅ 注册 `IORegisterForSystemPower`，`kIOMessageSystemWillSleep` 时写 `F*md=0`；睡眠中的 DarkWake（无显示能力）**不接管**，只在完全唤醒时重新接管（2.1.1） | 🔴 **无**。主二进制、特权 helper、全部 Qt 框架**均未导入任何电源管理符号**，只导入 `IOServiceOpen` + `IOConnectCallStructMethod` | 📄 `dyld_info -imports`（方法已过正对照，见 §4）|
 | 2 | **命令行控制** | ✅ `fanctl` + 配置文件 | 🔴 **完全没有**：包内无 CLI 二进制 · 无 `.sdef`（不支持 AppleScript）· `Info.plist` 无 `CFBundleURLTypes` · 主程序 `strings` 无任何 `--xxx`/`usage:` | 📄 四路核实 |
 | 3 | **配置真源** | ✅ **配置文件**。守护监视配置目录，改完**即刻生效**（原地编辑 ≤ 10 s），不用重启、不用提权 | ⚠️ **进程内存才是真源**。偏好里只是快照（`ActivePreset` = base64 的 `UNSAVED\|1,3200\|1,3200`），必须**重启 App** 才读；且它退出时会**回写覆盖**你的外部修改 | 🔬 base64 解码 + 与 SMC `F*Tg` 交叉验证一致 |
 | 4 | **CPU（稳态）** | **0.017%**（1.3.0：0.100%） | **0.30 ~ 0.35%** | 🔬 双方都是 `powermetrics --samplers tasks` 实测（FanPilot 2026-10-28 120 s 窗口；MFC 2026-09-20 两窗口） |
