@@ -106,8 +106,11 @@ wait_reload(){ sleep 2; }   # 守护监视配置目录、即刻重载；2s 足�
 
 fan_target(){ "${FANCTL}" kv 2>/dev/null | sed -n "s/^fan$1_target=//p" | cut -d. -f1; }
 # 某百分比在风扇 f 上的期望目标 —— 镜像 fl_fan_target（四舍五入到 1 RPM，夹硬件范围）
+# 🩸 2026-10-28：测试把转速降到 60% ⇒ 本来就热的机器真被测到全核平均 90.2°C、紧急打满，4 条判据误报。
+#    ⇒ ① 测试档位一律**高于**使用者的 90%（95/96/94），测试期间风扇只会更快 ② 紧急态下期望值 = 硬件上限
 exp_target(){
   local mx mn; mx="$(stat_fan_field "$1" max)"; mn="$(stat_fan_field "$1" min)"
+  if [ "$(stat_str mode)" = "emergency" ]; then echo "${mx}"; return; fi
   awk -v p="$2" -v mx="${mx}" -v mn="${mn}" 'BEGIN{t=int(mx*p/100+0.5); if(t<mn)t=mn; if(t>mx)t=mx; print t}'; }
 stat_fan_field(){ awk -v f="$1" -v k="\"$2\"" -F'[:,]' '/"id": /{id=$2+0; for(i=1;i<=NF;i++) if($i ~ k"$" || $i ~ " "k) {v=$(i+1)+0}; if(id==f){print v; exit}}' "${STATUS}"; }
 fan_md(){     "${FANCTL}" kv 2>/dev/null | sed -n "s/^fan$1_mode=//p"; }
@@ -119,11 +122,11 @@ pgrep -x fanpilotd >/dev/null 2>&1 && DAEMON_UP=1
 # ═══════════════════════════════════════════════════════════════════
 grp "E2E-1 用户路径：从菜单改定速 → 即刻生效（无需 reload、无需密码）"
 if [ "${DAEMON_UP}" = "1" ]; then
-  set_key percent 60
+  set_key percent 95
   wait_reload
-  t0="$(fan_target 0)"; t1="$(fan_target 1)"; x0="$(exp_target 0 60)"; x1="$(exp_target 1 60)"
+  t0="$(fan_target 0)"; t1="$(fan_target 1)"; x0="$(exp_target 0 95)"; x1="$(exp_target 1 95)"
   [ "${t0}" = "${x0}" ] && [ "${t1}" = "${x1}" ] && [ "${t0}" != "${t1}" ] \
-    && ok "percent = 60 → 2s 内 SMC 目标 ${t0}/${t1}（两风扇按各自上限折算，即刻生效）" \
+    && ok "percent = 95 → 2s 内 SMC 目标 ${t0}/${t1}（两风扇按各自上限折算，即刻生效）" \
     || bad "SMC 目标 ${t0}/${t1}，期望 ${x0}/${x1} —— 自动重载或折算有误"
   [ "$(fan_md 0)$(fan_md 1)" = "11" ] && ok "两风扇手动模式" || bad "风扇未处于手动模式"
 else
@@ -317,6 +320,12 @@ if [ -x "${DBIN}" ]; then
   a0="$(kv fan0_md_after)"; a1="$(kv fan1_md_after)"
   [ "${a0}" = "0" ] && [ "${a1}" = "0" ] && ok "WillSleep 后两风扇 F*md 真变 0（已交还固件）" \
                                          || bad "WillSleep 后 F*md 仍是 ${a0}/${a1}"
+  [ "$(kv darkwake_stays_firmware)" = "1" ] \
+    && ok "⭐DarkWake（能力 0x09，无显示）收到「已唤醒」后风扇仍归固件（md=$(kv darkwake_fan0_md)/$(kv darkwake_fan1_md)）" \
+    || bad "DarkWake 时风扇被接管 —— 合盖放包里会每小时冲一次定速（本机约每小时一次 DarkWake）"
+  [ -n "$(kv system_caps)" ] && [ "$(kv system_caps)" != "-1" ] \
+    && ok "读得到系统能力（System Capabilities = $(kv system_caps)）—— 能区分 DarkWake" \
+    || bad "读不到系统能力 —— 无法区分 DarkWake，会按完全唤醒接管"
   [ "${rc}" = "0" ] && ok "--selftest-pm pass" || bad "--selftest-pm 失败"
   if [ "${DAEMON_UP}" = "1" ]; then
     # 自愈：自检交还后，在跑的守护下一次巡检（≤10s）必须重新接管
@@ -367,23 +376,23 @@ if [ "${DAEMON_UP}" = "1" ]; then
                         || bad "目录噪音触发了 $(( r2 - r1 )) 次重载 —— 重载风暴回归"
   [ "${w2}" = "${w1}" ] && ok "目录噪音期间写 SMC 0 次" || bad "目录噪音期间写了 SMC $(( w2 - w1 )) 次"
   # 反向对照：真改配置必须恰好触发重载（否则上面的 0 可能是监视失效的假绿）
-  set_key percent 61; wait_reload
+  set_key percent 96; wait_reload
   r3="$(reload_count)"
   [ "${r3}" -gt "${r2}" ] && ok "⭐反向：真改配置触发了重载（$(( r3 - r2 )) 次）—— 监视没失效" \
                           || bad "真改配置也没重载 —— 目录监视失效"
   # 🩸「重载了」是代理量：初版这条绿着，而 SMC 目标根本没变（容差吃掉了 50 RPM 的改动）
-  [ "$(fan_target 0)" = "$(exp_target 0 61)" ] && ok "⭐SMC 目标真的变成 $(exp_target 0 61)（判硬件事实，不判「重载了」）" \
-                                 || bad "重载了但 SMC 目标是 $(fan_target 0)，不是 $(exp_target 0 61)"
+  [ "$(fan_target 0)" = "$(exp_target 0 96)" ] && ok "⭐SMC 目标真的变成 $(exp_target 0 96)（判硬件事实，不判「重载了」）" \
+                                 || bad "重载了但 SMC 目标是 $(fan_target 0)，不是 $(exp_target 0 96)"
   e_before="$(stat_num external_overrides)"
   # 原地写（不改目录项）：只能靠巡检时的 stat 兜底 —— 必须在一个巡检周期内生效
-  sed 's/^percent = .*/percent = 59/' "${CONF}" > /tmp/e2e-inplace.conf && cat /tmp/e2e-inplace.conf > "${CONF}"
+  sed 's/^percent = .*/percent = 94/' "${CONF}" > /tmp/e2e-inplace.conf && cat /tmp/e2e-inplace.conf > "${CONF}"
   sleep 12
-  [ "$(fan_target 0)" = "$(exp_target 0 59)" ] && ok "原地写配置（cp/nano 式）在一个巡检周期内生效" \
+  [ "$(fan_target 0)" = "$(exp_target 0 94)" ] && ok "原地写配置（cp/nano 式）在一个巡检周期内生效" \
                                  || bad "原地写配置 12s 后仍未生效（目标 $(fan_target 0)）"
   [ "$(stat_num external_overrides)" = "${e_before}" ] \
     && ok "[回归] 使用者原地改配置**不**被算成外部抢写（否则 3 次就错误让步）" \
     || bad "原地改配置被算成外部改动（${e_before} → $(stat_num external_overrides)）"
-  set_key percent 61; wait_reload
+  set_key percent 96; wait_reload
 else
   skip "真守护未运行，跳过 R15"
 fi
@@ -394,7 +403,7 @@ if [ "${DAEMON_UP}" = "1" ]; then
   e0="$(stat_num external_overrides)"
   "${FANCTL}" rpm 0 2222 >/dev/null 2>&1
   sleep 12
-  [ "$(fan_target 0)" = "$(exp_target 0 61)" ] && ok "外部改动被下一次巡检纠正（2222 → $(exp_target 0 61)）" \
+  [ "$(fan_target 0)" = "$(exp_target 0 96)" ] && ok "外部改动被下一次巡检纠正（2222 → $(exp_target 0 96)）" \
                                  || bad "外部改动未被纠正（目标 $(fan_target 0)）"
   e1="$(stat_num external_overrides)"
   [ "${e1:-0}" -gt "${e0:-0}" ] && ok "外部改动被计数并留痕（${e0}→${e1}）" || bad "外部改动未计数"
@@ -406,8 +415,9 @@ if [ "${DAEMON_UP}" = "1" ]; then
   w1="$(stat_num writes_total)"; "${FANCTL}" rpm 0 2333 >/dev/null 2>&1; sleep 11; w2="$(stat_num writes_total)"
   [ "${w2}" = "${w1}" ] && ok "让步期间再被改也写 SMC 0 次" || bad "让步期间仍写了 $(( w2 - w1 )) 次"
   # 使用者显式改设置 = 结束让步
-  set_key percent 60; wait_reload
-  [ "$(stat_str mode)" = "normal" ] && [ "$(fan_target 0)" = "$(exp_target 0 60)" ] \
+  set_key percent 95; wait_reload
+  m="$(stat_str mode)"
+  { [ "${m}" = "normal" ] || [ "${m}" = "emergency" ]; } && [ "$(fan_target 0)" = "$(exp_target 0 95)" ] \
     && ok "使用者改设置后立刻结束让步并接管（目标 $(fan_target 0)）" \
     || bad "改设置后仍在让步（mode=$(stat_str mode)）"
 else
