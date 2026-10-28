@@ -1,3 +1,5 @@
+> 📦 **档案**：本文是 1.x（自适应曲线）的设计记录。2.0 起只保留定速、曲线整套删除 —— 现行设计见 README「架构」与 CHANGELOG 2.0.0。
+
 # FanPilot 开发计划
 
 > 前置调研与全部实测数据：[`SMC-RESEARCH.md`](SMC-RESEARCH.md)
