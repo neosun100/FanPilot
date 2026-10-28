@@ -43,9 +43,8 @@ if [ ! -f "${SRC}/Contents/Resources/FanPilot.icns" ]; then
   fi
 fi
 rm -rf "${DST}"
-cp -R "${SRC}" "${DST}"
-# 🔴 cp -R 之后必须重签：ad-hoc 签名绑定路径外的内容哈希，复制本身不破签名，
-#    但若上面刚生成过图标，源 bundle 的签名已在 make-icns.sh 里重签过，这里无需再动。
+ditto "${SRC}" "${DST}"     # ditto 保留扩展属性与签名；cp -R 不保证（macos-menubar-app 铁律 2）
+# 🔴 若上面刚生成过图标，源 bundle 已在 make-icns.sh 里重签过，这里无需再动。
 echo "  ✅ 已复制$([ -f "${DST}/Contents/Resources/FanPilot.icns" ] && echo "（含图标）")"
 
 echo "=== 3. 挂 LaunchAgent（开机自启）==="

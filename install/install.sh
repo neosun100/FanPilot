@@ -39,56 +39,30 @@ install -d -m 755 /usr/local/sbin /usr/local/etc "${CONF_DIR}"
 install -m 755 "${BIN_SRC}" "${BIN_DST}"
 echo "  ✅ ${BIN_DST}"
 
+# 旧配置没有 `percent` 行（1.x 全是曲线参数）⇒ 备份后换成 2.x 模板，不静默沿用
+if [ -f "${CONF_DST}" ] && ! grep -Eq '^[[:space:]]*percent[[:space:]]*=' "${CONF_DST}"; then
+  bak="${CONF_DST}.1x-$(date +%Y%m%d%H%M%S).bak"
+  mv "${CONF_DST}" "${bak}"
+  echo "  ↪ 旧配置已备份为 ${bak}（2.0 只保留定速百分比，旧参数不再使用）"
+fi
 if [ -f "${CONF_DST}" ]; then
   echo "  ⏭  ${CONF_DST} 已存在，保留用户配置不覆盖"
 else
   cat > "${CONF_DST}" <<'CONF'
-# FanPilot 配置（key = value，改完 `sudo killall -HUP fanpilotd` 热加载）
+# FanPilot 2 配置（key = value）。菜单栏选档会改 percent 一行；手改保存后生效（≤10s）。
 
-# ═══ 转速模式（菜单栏可切）═══
-fan_mode   = curve       # curve = 按温度自适应 / fixed = **定死转速**
-fixed_rpm  = 3000        # fan_mode=fixed 时的转速（会按各风扇硬件范围夹取）
-emergency_override = 1   # 定死模式下是否仍保留 emergency_temp 打满（1=保留，推荐）
-#
-# 🩸 为什么有 fixed 这一档：本机 2026-09-13~14 两天内发生 5 次 PMU 硬件看门狗
-#    复位（SOCD/iBoot panic）。唯一有长期无崩溃记录的配置，是「把转速钉死、
-#    之后基本不再写 SMC」那种用法。
-#    · curve 模式：约 16 次/分 ≈ 2.3 万次/天 写 SMC
-#    · fixed 模式：首次爬升到位后稳态 **0 次/分**
-#    这是目前唯一能解释「崩溃间隔为何从 10 小时缩短到 1~2 小时」的单变量差异。
-#    ⚠️ 相关不等于因果，根因仍未确定。这一档是**降低暴露面**，不是已证明的修复。
-#    ⇒ fixed 模式下 min_rpm / max_rpm / ema_seconds / 曲线 全部不参与。
+# 定速：各风扇**硬件上限的百分比**（0~100）。两风扇上限不同，按各自上限折算：
+#   本机 85% ⇒ 风扇0 4547 / 风扇1 4910 RPM。低于硬件下限时按下限转，不会停转。
+percent = 50
 
-poll_interval  = 2.0     # 轮询间隔(秒)。实测 2.0s ⇒ CPU 0.100%
-                         # fixed 模式下可放大（如 10）以进一步减少 SMC **读**取
-min_rpm        = 2000    # 转速下限。⭐ 它本身就是失效安全：守护若被 kill -9,
-                         #   风扇保持最后转速，最坏卡在 >=2000（比出厂空闲的 0 转风量还大）
-max_rpm        = 0       # 上限；0 = 用各风扇的硬件上限(F0=5349 / F1=5777)
-ema_seconds    = 15      # 温度平滑时间常数。实测 Tp00 在 70s 内极差 10.77°C,
-                         #   不平滑风扇会跟着尖峰上下窜
-slew_up        = 200     # 升速限幅 RPM/秒（实测硬件 0->2500 约 6~9s,200 不会超硬件能力）
-slew_down      = 60      # 降速限幅 RPM/秒。非对称是「丝滑」的关键：散热要快、安静要稳
-deadband       = 50      # 目标变化小于此值不写 SMC（硬件自身抖动 ±8~33 RPM,50 不损精度）
-emergency_temp = 90      # 超过此温度直接打满并忽略限幅（用原始值,不用平滑值）
-                         # 判据用哪个温度由下面的 temp_source 决定（两者同口径）
+# 安全巡检间隔（秒，5~60）。每次巡检只**读** SMC：温度 + 回读风扇寄存器。
+# 回读一致就什么都不写 ⇒ 稳态写 SMC 0 次。
+check_interval = 10
 
-# 温度口径三档（菜单栏可直接切换，改完即刻生效）
-temp_source      = average
-                         #   max     = 最高核心温度（最保守，风扇最早升速）
-                         #   average = 全核平均（默认，比最高低约 3~13°C）
-                         #   min     = 最低核心温度（最安静，比最高低约 20~25°C）
-                         # 它决定**曲线与菜单栏显示**用哪个温度。
-
+# 紧急打满：温度 ≥ 此值时两风扇直接打满，降到「此值 - 5°C」以下恢复定速（70~95，硬夹）
+emergency_temp = 90
+# 紧急判据用哪个温度：max（最高核心）/ average（全核平均）/ min
 emergency_source = average
-                         # 🔴 90°C 紧急判据用哪个温度 —— **独立于 temp_source**。
-                         # 为什么拆开：实测最高核与最低核温差约 24°C，
-                         #   若紧急也用 min，最低核要到 90°C 意味着整机已彻底失控，
-                         #   这道保护不是被削弱而是**等于关掉**。
-                         # 想让它跟随曲线口径，把这里改成同一个值即可。
-                         # ⚠️ 无论怎么设，macOS/SoC 自身的硬件过热保护都仍然生效
-
-# 分段线性曲线 温度:转速
-curve          = 45:2000, 55:2600, 65:3400, 75:4300, 85:5300
 CONF
   echo "  ✅ ${CONF_DST}（默认配置）"
 fi
@@ -100,7 +74,7 @@ fi
 #   为什么可接受：守护把所有安全相关的值**硬夹**在代码里，不相信配置文件 ——
 #     · 目标转速夹在运行时读到的 F*Mn~F*Mx 内（S2）
 #     · emergency_temp 夹在 70~95°C（不许把紧急保护调没）
-#     · 紧急路径忽略用户 max_rpm，只受硬件上限约束
+#     · check_interval 夹在 5~60s；SMC 写入有令牌桶硬上限（防写入风暴）
 #   ⇒ 最坏情况是风扇转速在合法范围内被改动，紧急过热保护**无法**被绕过。
 # ⚠️ 必须用 /usr/bin/stat 绝对路径：若装了 GNU coreutils，`stat` 会被它抢占，
 #    而 GNU stat 的 `-f` 是「查文件系统」不是「格式化输出」—— 会静默返回一堆
@@ -136,6 +110,15 @@ install -m 644 "${PLIST_SRC}" "${PLIST_DST}"
 kacount="$(grep -c -A1 '<key>KeepAlive</key>' "${PLIST_DST}" || true)"
 [ "${kacount}" != "0" ] || die "plist 里没有 KeepAlive —— 它是失效安全机制,拒绝安装" 6
 
+# 🩸 2026-10-28 实测：做对照实验时 `launchctl disable` 过本服务 —— 这个开关**持久**（跨重启），
+#    之后 bootstrap 一律报「5: Input/output error」，与「旧实例没拆净」的 EIO 长得一样。
+#    判当前事实：被禁用就显式启用，并说出来（不静默改用户的设置）。
+n_dis="$(launchctl print-disabled system 2>/dev/null | grep -c "\"${LABEL}\" => disabled" || true)"
+if [ "${n_dis}" != "0" ]; then
+  launchctl enable "system/${LABEL}"
+  echo "  ↪ 服务曾被 launchctl disable（持久开关），已重新 enable"
+fi
+
 ok=0
 for _ in 1 2 3; do
   if launchctl bootstrap system "${PLIST_DST}" 2>/dev/null; then ok=1; break; fi
@@ -166,7 +149,7 @@ echo "── 当前状态 ──"
 cat "${STATUS}"
 echo
 echo "✅ 安装完成"
-echo "   配置: ${CONF_DST}（改完 sudo killall -HUP fanpilotd）"
+echo "   配置: ${CONF_DST}（保存即生效）"
 echo "   状态: ${STATUS}"
 echo "   日志: ${LOG}"
 echo "   验收: sudo bash install/verify.sh"

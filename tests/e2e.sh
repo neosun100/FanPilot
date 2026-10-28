@@ -73,7 +73,7 @@ restore(){
   if [ -s "${BACKUP}" ]; then
     cp "${BACKUP}" "${CONF}"
     chown "${CONSOLE_USER_G}" "${CONF}" 2>/dev/null || true   # 同上：别留下 root 属主
-    sleep 6      # 等守护自动重载回原配置
+    sleep 12     # cp 是原地写（不触发目录事件）⇒ 靠下一次巡检的 stat 兜底，≤ check_interval
   fi
   rm -f "${BACKUP}" /tmp/e2e-*.conf /tmp/e2e-*.json /tmp/e2e-*.png
 }
@@ -102,36 +102,33 @@ set_key(){
   #    所以每次写完都必须把属主还回控制台用户。
   chown "${CONSOLE_USER_G}" "${CONF}" 2>/dev/null || true
 }
-wait_reload(){ sleep 7; }   # 守护每 poll_interval 检查 mtime；给足余量
+wait_reload(){ sleep 2; }   # 守护监视配置目录、即刻重载；2s 足够（1.x 轮询要 7s）
+
+fan_target(){ "${FANCTL}" kv 2>/dev/null | sed -n "s/^fan$1_target=//p" | cut -d. -f1; }
+# 某百分比在风扇 f 上的期望目标 —— 镜像 fl_fan_target（四舍五入到 1 RPM，夹硬件范围）
+exp_target(){
+  local mx mn; mx="$(stat_fan_field "$1" max)"; mn="$(stat_fan_field "$1" min)"
+  awk -v p="$2" -v mx="${mx}" -v mn="${mn}" 'BEGIN{t=int(mx*p/100+0.5); if(t<mn)t=mn; if(t>mx)t=mx; print t}'; }
+stat_fan_field(){ awk -v f="$1" -v k="\"$2\"" -F'[:,]' '/"id": /{id=$2+0; for(i=1;i<=NF;i++) if($i ~ k"$" || $i ~ " "k) {v=$(i+1)+0}; if(id==f){print v; exit}}' "${STATUS}"; }
+fan_md(){     "${FANCTL}" kv 2>/dev/null | sed -n "s/^fan$1_mode=//p"; }
+reload_count(){ grep -c '^生效配置' /var/log/fanpilotd.log 2>/dev/null || echo 0; }
+
+DAEMON_UP=0
+pgrep -x fanpilotd >/dev/null 2>&1 && DAEMON_UP=1
 
 # ═══════════════════════════════════════════════════════════════════
-grp "E2E-1 用户路径：从菜单改下限 → 自动生效（无需 reload、无需密码）"
-before="$(stat_num min_rpm)"
-set_key min_rpm 3000
-wait_reload
-after="$(stat_num min_rpm)"
-[ "${after%.*}" = "3000" ] && ok "改下限 ${before%.*} → 3000 自动生效（守护监视 mtime）" \
-                           || bad "下限仍为 ${after}（自动重载失效）"
-
-# ⭐ 用户诉求的核心：抬高下限后曲线必须**重新铺开**，不能压平出死区
-eff="$("${BIN}" --config "${CONF}" --check-config 2>/dev/null)"
-mono=1; prev=""
-while IFS= read -r r; do
-  [ -z "${prev}" ] || awk -v a="${prev}" -v b="${r}" 'BEGIN{exit !(b>a+1)}' || mono=0
-  prev="${r}"
-done < <(printf '%s\n' "${eff}" | sed -n 's/^fan0_curve[0-9]*=[0-9.]*:\([0-9]*\)$/\1/p')
-[ "${mono}" = "1" ] && ok "⭐下限 3000 时曲线 5 点严格递增 —— 无死区（曲线自适应生效）" \
-                    || bad "曲线出现平段/回落 —— 抬高下限后压平了"
-
-# 实际目标必须跟到新下限之上
-t0="$(sed -n 's/.*"target_rpm"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' "${STATUS}" | head -1)"
-awk -v t="${t0:-0}" 'BEGIN{exit !(t>=2999)}' && ok "风扇目标 ${t0} ≥ 新下限 3000" \
-                                             || bad "风扇目标 ${t0} < 3000（下限未施加）"
-
-grp "E2E-2 恢复原配置 → 目标回落"
-set_key min_rpm 2000
-wait_reload
-[ "$(stat_num min_rpm | cut -d. -f1)" = "2000" ] && ok "下限恢复 2000" || bad "下限未恢复"
+grp "E2E-1 用户路径：从菜单改定速 → 即刻生效（无需 reload、无需密码）"
+if [ "${DAEMON_UP}" = "1" ]; then
+  set_key percent 60
+  wait_reload
+  t0="$(fan_target 0)"; t1="$(fan_target 1)"; x0="$(exp_target 0 60)"; x1="$(exp_target 1 60)"
+  [ "${t0}" = "${x0}" ] && [ "${t1}" = "${x1}" ] && [ "${t0}" != "${t1}" ] \
+    && ok "percent = 60 → 2s 内 SMC 目标 ${t0}/${t1}（两风扇按各自上限折算，即刻生效）" \
+    || bad "SMC 目标 ${t0}/${t1}，期望 ${x0}/${x1} —— 自动重载或折算有误"
+  [ "$(fan_md 0)$(fan_md 1)" = "11" ] && ok "两风扇手动模式" || bad "风扇未处于手动模式"
+else
+  skip "真守护未运行，跳过活体用户路径"
+fi
 
 # ═══════════════════════════════════════════════════════════════════
 grp "回归 R1 —— 配置目录不可写导致改设置静默失败"
@@ -189,10 +186,9 @@ else
 fi
 
 grp "回归 R5 —— 安全阈值被配置绕过"
-# 真实 bug①：max_rpm 设很低 ⇒ 紧急打满被用户上限挡住
-# 真实 bug②：emergency_temp 设 200 ⇒ 紧急保护被整个禁用
+# 真实 bug（1.x）：emergency_temp 设 200 ⇒ 紧急保护被整个禁用
 EVIL=/tmp/e2e-evil.conf
-printf 'emergency_temp = 200\npoll_interval = 0.01\nema_seconds = 9999\ndeadband = 99999\nslew_up = 1\n' > "${EVIL}"
+printf 'emergency_temp = 200\ncheck_interval = 0.01\npercent = 500\n' > "${EVIL}"
 e="$("${BIN}" --config "${EVIL}" --check-config 2>/dev/null)"
 chk_clamp(){
   local got; got="$(printf '%s\n' "$e" | awk -F= -v k="$1" '$1==k{print $2;exit}')"
@@ -200,22 +196,20 @@ chk_clamp(){
     && ok "$1 被夹到 $2" || bad "$1=${got:-读不到}，期望 $2 —— 阈值可被绕过"
 }
 chk_clamp emergency_temp 95
-chk_clamp poll_interval  0.50
-chk_clamp ema_seconds    120
-chk_clamp deadband       500
-chk_clamp slew_up        10
+chk_clamp check_interval 5
+chk_clamp percent 100
+chk_clamp fan0_effective_target "$(printf '%s\n' "$e" | sed -n 's/^fan0_hw_max=//p')"
+chk_clamp fan1_effective_target "$(printf '%s\n' "$e" | sed -n 's/^fan1_hw_max=//p')"
 
-grp "回归 R6 —— --check-config 显示模板而非生效曲线"
-# 真实 bug：check-config 在读到硬件上限前就 return，打印的是模板 ⇒ 看起来能验其实验不到
+grp "回归 R6 —— --check-config 显示模板而非生效值"
+# 真实 bug（1.x）：check-config 在读到硬件范围前就 return ⇒ 看起来能验其实验不到
 hw="$(printf '%s\n' "$e" | grep -c '^fan[01]_hw_max=' || true)"
-[ "${hw}" = "2" ] && ok "check-config 报告两风扇各自的硬件上限（显示真正生效的）" \
-                  || bad "check-config 未报告硬件上限 —— 又变成只显示模板"
-# 两风扇上限不同 ⇒ 曲线末点必须不同（否则风扇1 白丢余量）
-l0="$(printf '%s\n' "$e" | sed -n 's/^fan0_curve4=[0-9.]*:\([0-9]*\)$/\1/p')"
-l1="$(printf '%s\n' "$e" | sed -n 's/^fan1_curve4=[0-9.]*:\([0-9]*\)$/\1/p')"
+[ "${hw}" = "2" ] && ok "check-config 报告两风扇各自的硬件上限" || bad "check-config 未报告硬件上限"
+l0="$(printf '%s\n' "$e" | sed -n 's/^fan0_effective_target=//p')"
+l1="$(printf '%s\n' "$e" | sed -n 's/^fan1_effective_target=//p')"
 [ -n "${l0}" ] && [ -n "${l1}" ] && [ "${l0}" != "${l1}" ] \
-  && ok "两风扇曲线末点不同（${l0} / ${l1}）—— 各自铺到自己上限" \
-  || bad "两风扇曲线末点相同（${l0}/${l1}）—— 风扇1 丢失余量"
+  && ok "超上限时两风扇生效目标不同（${l0} / ${l1}）—— 各自夹到自己的上限" \
+  || bad "两风扇生效目标相同（${l0}/${l1}）—— 硬件范围没有逐风扇读取"
 
 grp "回归 R7 —— 菜单栏宽度横跳 / emoji 变黑块 / 靠上对齐"
 if [ -x "${APPBIN}" ]; then
@@ -274,157 +268,159 @@ n="$(grep -c 'forMode: .common' "${ROOT}/app/Sources/FanPilotMenu/main.swift" ||
 n2="$(grep -c 'func menuWillOpen' "${ROOT}/app/Sources/FanPilotMenu/main.swift" || true)"
 [ "${n2}" != "0" ] && ok "实现 menuWillOpen（打开瞬间先刷一次）" || bad "缺 menuWillOpen"
 
-grp "回归 R9 —— 下限档位标签语义错误"
-# 真实 bug：标签用三元表达式只覆盖 3 档，1500/2500/3500/4000 全落到「强散热」；
-#          且「强散热」本身是误导 —— 下限不改变高温散热能力
-sw="$(grep -c 'case 1500: hint' "${ROOT}/app/Sources/FanPilotMenu/main.swift" || true)"
-[ "${sw}" != "0" ] && ok "档位标签逐档定义（不是只覆盖 3 档的三元表达式）" \
-                   || bad "档位标签未逐档定义 —— 会有档位落到错误的 else"
-# 剥掉注释后再判：否则会命中「初版把 4000 标成强散热是误导」这句注释本身
-mis="$(nocomment_swift "${ROOT}/app/Sources/FanPilotMenu/main.swift" | grep -c '强散热' || true)"
-[ "${mis}" = "0" ] && ok "无「强散热」误导性标签（已剥注释后判定）" \
-                   || bad "仍有「强散热」标签 —— 会让人以为高档能压住高负载"
-
 grp "回归 R10 —— 逻辑在两处重复（守护与 fanlogic.h 分叉）"
-for fn in fl_curve_eval fl_clamp_fan fl_ema fl_slew fl_should_write fl_fault_check; do
+for fn in fl_cfg_load fl_fan_target fl_emergency_next fl_needs_rewrite fl_bucket_take fl_fight_note; do
   n="$(grep -c "${fn}" "${ROOT}/src/fanpilotd.c" || true)"
-  [ "${n}" != "0" ] || bad "守护未使用 ${fn}（逻辑可能又复制了一份）"
+  [ "${n}" != "0" ] && ok "守护使用 ${fn}（单一来源 fanlogic.h）" \
+                    || bad "守护未使用 ${fn}（逻辑可能又复制了一份）"
 done
-dup="$(grep -cE '^static (double|int) (curve_eval|clamp_fan)\(' "${ROOT}/src/fanpilotd.c" || true)"
-[ "${dup}" = "0" ] && ok "守护内无重复的决策逻辑实现（单一来源 fanlogic.h）" \
-                   || bad "守护内仍有重复实现 —— 两份都可能被当权威，必然分叉"
+dup="$(grep -cE '^static (void|int) (cfg_load|parse_curve|parse_src)\(' "${ROOT}/src/fanpilotd.c" || true)"
+[ "${dup}" = "0" ] && ok "守护内无重复的配置解析实现" || bad "守护内仍有重复实现 —— 必然分叉"
 
 grp "回归 R11 —— 菜单槽位错位（骨架槽位数 ≠ set() 调用数）"
-# 真实 bug（2026-09-14）：温度口径加到三档时**只加了 set() 没加骨架槽位**，
-#   导致「平滑后」往下整体串一格：风扇标题跑到缩进层、轮询行挂到「开机自动启动」下面、
-#   最后一行被 `dyn.indices.contains(i)` **静默丢弃**。肉眼与 grep 都查不出来。
-# ⭐ 判据必须是「真的把菜单渲染一遍」，不是 grep 源码数行数
-#   （grep 会命中注释、也数不清 for 循环里的槽位）。
+# 真实 bug（2026-09-14）：只加了 set() 没加骨架槽位 ⇒ 菜单整体串一格、最后一行被静默丢弃
 if [ -x "${APPBIN}" ]; then
   if dm="$("${APPBIN}" --dump-menu 2>&1)"; then
     ok "--dump-menu 槽位契约成立（$(printf '%s' "${dm}" | sed -n 's/^槽位 \(.*\)$/\1/p')）"
   else
-    bad "--dump-menu 报告槽位不匹配 —— 菜单有行错位或被丢弃：$(printf '%s' "${dm}" | tail -1)"
+    bad "--dump-menu 报告槽位不匹配：$(printf '%s' "${dm}" | tail -1)"
   fi
-  # 三档温度必须都在菜单里出现，且**恰好一档**被标为曲线输入
-  for L in 最高核心 全核平均 最低核心 平滑后; do
-    printf '%s\n' "${dm}" | grep -q "${L}" \
-      && ok "菜单含「${L}」行" || bad "菜单缺「${L}」行"
-  done
-  nc="$(printf '%s\n' "${dm}" | grep -c '← 曲线输入' || true)"
-  [ "${nc}" = "1" ] && ok "恰好一档被标为「曲线输入」" \
-                    || bad "被标为「曲线输入」的档位有 ${nc} 个（应为 1）"
-  ne="$(printf '%s\n' "${dm}" | grep -c '紧急判据 ≥' || true)"
-  [ "${ne}" = "1" ] && ok "恰好一档被标为「紧急判据」，且带阈值数字" \
-                    || bad "「紧急判据」标记有 ${ne} 处（应为 1）"
-  # 🩸 旧版用 `！紧急` 这种裸符号，读起来像告警（"81.9°C！紧急"）而实际只是口径标注。
-  #    剥注释后判：源码里不得再出现这两个无说明的符号标记。
-  bads="$(nocomment_swift "${ROOT}/app/Sources/FanPilotMenu/main.swift" \
-          | grep -cE '★曲线|!紧急' || true)"
-  [ "${bads}" = "0" ] && ok "无无说明的符号标记（★曲线 / !紧急 已改成完整词组）" \
-                      || bad "仍有 ${bads} 处裸符号标记 —— 没有图例，只有作者看得懂"
-  # 同一事实只写一处：不得再有独立的「紧急判据用：」行与行内标记并存
-  dupe="$(nocomment_swift "${ROOT}/app/Sources/FanPilotMenu/main.swift" \
-          | grep -c '紧急判据用' || true)"
-  [ "${dupe}" = "0" ] && ok "紧急判据只标在它监视的那行温度旁（无重复的独立行）" \
-                      || bad "紧急判据有两处表述 —— 改一处忘另一处就会自相矛盾"
+  if [ "${DAEMON_UP}" = "1" ]; then
+    for L in 最高核心 全核平均 固定转速 自定义百分比; do
+      [ "$(printf '%s\n' "${dm}" | grep -c "${L}" || true)" != "0" ] \
+        && ok "菜单含「${L}」" || bad "菜单缺「${L}」"
+    done
+    ne="$(printf '%s\n' "${dm}" | grep -c '紧急判据 ≥' || true)"
+    [ "${ne}" = "1" ] && ok "恰好一行温度被标为「紧急判据」，且带阈值" \
+                      || bad "「紧急判据」标记有 ${ne} 处（应为 1）"
+    nchk="$(printf '%s\n' "${dm}" | grep -c '\[✓\]' || true)"
+    [ "${nchk}" -le 1 ] && ok "定速档最多一个被勾选（${nchk}）" || bad "多个定速档同时被勾选"
+  fi
+  # 2.0 删掉的概念不得残留在菜单（翻新不追加）
+  left="$(nocomment_swift "${ROOT}/app/Sources/FanPilotMenu/main.swift" | grep -cE '转速下限|温度口径|自适应|曲线输入|平滑后' || true)"
+  [ "${left}" = "0" ] && ok "菜单无 1.x 曲线概念残留（已剥注释）" || bad "菜单仍有 ${left} 处曲线概念残留"
 else
   skip "菜单栏 App 未构建，跳过 R11"
 fi
 
 grp "回归 R12 —— 睡眠时不交还固件（风扇整夜转）"
-# 真实 bug（2026-09-14）：合盖睡眠 44 分钟（Clamshell Sleep · 电池），用户态全程冻结
-#   ⇒ 守护一次 SMC 都没写；而 F*md=1 是**锁存**的、不会自动回退
-#   ⇒ 风扇按合盖前的 3822 RPM 一直转。守护当时**完全没有**电源通知处理。
-# ⭐ 判据必须验「效果」而不是「接线」：--selftest-pm 直接投喂一条
-#   kIOMessageSystemWillSleep，然后**回读 SMC** 看 F*md 是否真变 0。
-#   这样这条最难测的路径不必真让机器睡一次就能反复验证。
+# 真实 bug（2026-09-14）：合盖 44 分钟，F*md=1 锁存 ⇒ 风扇按 3822 RPM 转了一整夜
+# ⭐ 判效果不判接线：--selftest-pm 投喂 WillSleep，回读 SMC 看 F*md 是否真变 0
 DBIN="${ROOT}/src/fanpilotd"
 if [ -x "${DBIN}" ]; then
   st="$("${DBIN}" --selftest-pm 2>&1)"; rc=$?
   kv(){ printf '%s\n' "${st}" | sed -n "s/^$1=//p"; }
-  [ "$(kv pm_registered)" = "1" ] && ok "IORegisterForSystemPower 注册成功（能收到睡眠通知）" \
+  [ "$(kv pm_registered)" = "1" ] && ok "IORegisterForSystemPower 注册成功" \
                                  || bad "电源通知注册失败 —— 睡眠交接不可能生效"
-  b0="$(kv fan0_md_before)"; a0="$(kv fan0_md_after)"; a1="$(kv fan1_md_after)"
-  [ "${a0}" = "0" ] && [ "${a1}" = "0" ] \
-    && ok "收到 WillSleep 后两风扇 F*md 真变 0（md ${b0}→${a0}，已交还固件）" \
-    || bad "WillSleep 后 F*md 仍是 ${a0}/${a1} —— 风扇会带着手动目标进入睡眠"
-  [ "${rc}" = "0" ] && ok "--selftest-pm 整体 pass（退出码 0）" \
-                    || bad "--selftest-pm 失败：$(printf '%s' "${st}" | sed -n 's/^result=//p')"
-  # 唤醒自愈：在跑的守护必须把 md 写回 1（否则一次自检就把风扇永久交还了）
-  sleep 5
-  m0="$("${FANCTL}" kv 2>/dev/null | sed -n 's/^fan0_mode=//p')"
-  [ "${m0}" = "1" ] && ok "5 秒后守护已重新接管（fan0_mode=1）—— 自检不会留下副作用" \
-                    || bad "守护未重新接管（fan0_mode=${m0}）—— 风扇被永久交还固件"
-  # 剥 C 注释（// 开头整行），并**一律用 grep -c 不用 grep -q**：
-  # 🩸 实测踩过（就在写这组测试时）：`set -o pipefail` 下 `sed X | grep -q PAT`
-  #    在 PAT 命中后 grep 立刻退出 ⇒ sed 收到 SIGPIPE(141) ⇒ **整条管道判为失败**，
-  #    尽管模式明明匹配到了。更阴的是它**位置相关**：靠文件末尾的模式（sed 已写完）
-  #    能通过，靠开头的必然失败 ⇒ 同一条判据对不同符号给出相反结论。
-  #    ⭐ 通则：管道里的判据只能用「数出来再比」，不能用「命中就早退」。
+  a0="$(kv fan0_md_after)"; a1="$(kv fan1_md_after)"
+  [ "${a0}" = "0" ] && [ "${a1}" = "0" ] && ok "WillSleep 后两风扇 F*md 真变 0（已交还固件）" \
+                                         || bad "WillSleep 后 F*md 仍是 ${a0}/${a1}"
+  [ "${rc}" = "0" ] && ok "--selftest-pm pass" || bad "--selftest-pm 失败"
+  if [ "${DAEMON_UP}" = "1" ]; then
+    # 自愈：自检交还后，在跑的守护下一次巡检（≤10s）必须重新接管
+    sleep 12
+    [ "$(fan_md 0)" = "1" ] && ok "≤12s 后守护已重新接管（自检不留副作用）" \
+                            || bad "守护未重新接管（fan0_mode=$(fan_md 0)）"
+  fi
   cnt_c(){ sed -E 's|^[[:space:]]*//.*$||' "${ROOT}/src/fanpilotd.c" | grep -c "$1" || true; }
-  # 收不到通知就等于没做：usleep 会让电源通知端口无人服务
-  [ "$(cnt_c CFRunLoopRunInMode)" != "0" ] \
-    && ok "主循环用 CFRunLoopRunInMode 等待（通知端口有人服务）" \
-    || bad "主循环仍只用 usleep —— 电源通知收不到，交接代码等于死代码"
-  # 必须应答，否则拖慢系统睡眠 30 秒
-  [ "$(cnt_c IOAllowPowerChange)" != "0" ] \
-    && ok "有 IOAllowPowerChange 应答（不拖慢系统睡眠）" \
-    || bad "缺 IOAllowPowerChange —— 每次睡眠被拖 30 秒超时"
-  # ⛔ 反向断言：风扇控制器永不否决睡眠
-  [ "$(cnt_c IOCancelPowerChange)" = "0" ] \
-    && ok "⭐反向：绝不 IOCancelPowerChange（不阻止机器睡觉）" \
-    || bad "出现 IOCancelPowerChange —— 风扇控制器无权否决睡眠"
-  # 唤醒必须清历史：否则从睡前的高目标限幅下降，等于唤醒瞬间无端吹一阵
-  [ "$(cnt_c 'g_ema = -1')" != "0" ] \
-    && ok "唤醒重新接管时清空 EMA（不按 44 分钟前的陈旧温度定速）" \
-    || bad "唤醒未清 EMA —— 会用睡前的陈旧温度决定转速"
-  # 起步与唤醒必须走同一条接管路径（否则两处会分叉）
-  [ "$(cnt_c 'takeover_fans')" -ge 3 ] \
-    && ok "起步与唤醒共用 takeover_fans（单一来源，不会分叉）" \
-    || bad "接管逻辑未共用 —— 起步与唤醒会各写一份并静默分叉"
+  [ "$(cnt_c IOAllowPowerChange)" != "0" ] && ok "有 IOAllowPowerChange 应答（不拖慢系统睡眠）" \
+                                           || bad "缺 IOAllowPowerChange —— 每次睡眠被拖 30 秒"
+  [ "$(cnt_c IOCancelPowerChange)" = "0" ] && ok "⭐反向：绝不 IOCancelPowerChange" \
+                                           || bad "出现 IOCancelPowerChange —— 无权否决睡眠"
+  # 🩸 2.0 新增：WillSleep 之后、真睡着之前的几秒内，巡检不得把 md 写回 1
+  [ "$(cnt_c 'if (g_sleeping)')" != "0" ] && ok "睡前窗口内巡检不重新接管（g_sleeping 闸门）" \
+                                          || bad "缺 g_sleeping 闸门 —— 交还后可能又被巡检写回手动"
 else
   skip "守护未构建，跳过 R12"
 fi
 
-grp "回归 R13 —— 定死转速模式必须真的停止写 SMC"
-# 加这一档的**全部理由**就是把稳态写入压到 0（见 fanlogic.h 的 fan_mode 注释）。
-# ⭐ 判据必须是「writes_total 真的不再增长」，不是「配置里写了 fixed」——
-#   后者只证明我改了配置，不证明行为变了。
-if [ -x "${DBIN}" ]; then
-  # --check-config 是只读的，守护没跑也能验（不占锁、不写 SMC）
-  cc="$("${DBIN}" --check-config 2>/dev/null)"
-  printf '%s\n' "${cc}" | grep -q "^fan_mode=" \
-    && ok "--check-config 报告 fan_mode（可离线核验生效模式）" \
-    || bad "--check-config 未报告 fan_mode"
-  printf '%s\n' "${cc}" | grep -q "^fan0_effective_target=" \
-    && ok "--check-config 报告每风扇**实际会写入**的目标值（不是模板）" \
-    || bad "--check-config 未报告 effective_target —— 又变成只显示模板"
-
-  if pgrep -x fanpilotd >/dev/null 2>&1; then
-    set_key fan_mode fixed; set_key fixed_rpm 3000
-    sleep 8                                    # 等守护按 mtime 自动重载 + 爬升
-    m="$(stat_str fan_mode)"
-    [ "${m}" = "fixed" ] && ok "守护已切到 fixed（状态文件回读）" \
-                         || bad "守护仍报 fan_mode=${m}"
-    w1="$(stat_num writes_total)"; sleep 12; w2="$(stat_num writes_total)"
-    d=$(( ${w2:-0} - ${w1:-0} ))
-    [ "${d}" -le 1 ] && ok "⭐定死模式 12 秒内写 SMC ${d} 次（≈0，这是本档存在的理由）" \
-                     || bad "定死模式仍在写 SMC ${d} 次/12s —— 目标没有真的恒定"
-    # 反向对照：切回曲线后必须重新开始写（否则上面的 0 可能是守护卡死造成的假绿）
-    set_key fan_mode curve
-    sleep 8
-    v1="$(stat_num writes_total)"; sleep 12; v2="$(stat_num writes_total)"
-    dv=$(( ${v2:-0} - ${v1:-0} ))
-    [ "${dv}" -gt "${d}" ] \
-      && ok "⭐反向：切回 curve 后写入恢复（${dv} 次/12s > ${d}）—— 证明上面的 0 不是卡死" \
-      || bad "切回 curve 后写入仍是 ${dv} 次/12s —— 上面的「0 次」可能是守护卡死的假绿"
-  else
-    skip "守护未运行（正在做 SOCD 复位的受控实验），跳过 fixed 模式的活体写入判据"
-  fi
+grp "回归 R13 —— 🔴 稳态写 SMC 必须为 0（使用者头号约束：写入风暴曾导致死机）"
+if [ "${DAEMON_UP}" = "1" ]; then
+  w1="$(stat_num writes_total)"; ts1="$(stat_num ts)"; sleep 35
+  w2="$(stat_num writes_total)"; ts2="$(stat_num ts)"
+  d=$(( ${w2:-0} - ${w1:-0} ))
+  [ "${d}" = "0" ] && ok "⭐稳态 35 秒（≥3 次巡检）写 SMC ${d} 次" \
+                   || bad "稳态 35 秒写 SMC ${d} 次 —— 定速必须写一次就不再动"
+  [ "${ts2:-0}" -gt "${ts1:-0}" ] && ok "⭐反向：同一窗口内巡检仍在进行（ts ${ts1}→${ts2}）—— 0 次不是卡死" \
+                                  || bad "ts 未前进 —— 上面的 0 次可能是守护卡死的假绿"
 else
-  skip "守护未构建，跳过 R13"
+  skip "真守护未运行，跳过 R13"
 fi
+
+grp "回归 R15 —— 配置目录噪音触发重载风暴（2026-10-28 开发中实测 23s 4074 次）"
+# 真实 bug：配置与状态文件同在 /tmp ⇒ 写状态 → 目录事件 → 重载 → 写状态 … 自触发
+# ⭐ 判据：往配置目录里狂造 50 次与配置无关的变化，重载次数必须不变
+if [ "${DAEMON_UP}" = "1" ]; then
+  r1="$(reload_count)"; w1="$(stat_num writes_total)"
+  for i in $(seq 50); do : > "$(dirname "${CONF}")/.e2e-noise-${i}"; rm -f "$(dirname "${CONF}")/.e2e-noise-${i}"; done
+  sleep 2
+  r2="$(reload_count)"; w2="$(stat_num writes_total)"
+  [ "${r2}" = "${r1}" ] && ok "⭐目录噪音 100 次事件 → 重载 0 次（只认配置文件身份变化）" \
+                        || bad "目录噪音触发了 $(( r2 - r1 )) 次重载 —— 重载风暴回归"
+  [ "${w2}" = "${w1}" ] && ok "目录噪音期间写 SMC 0 次" || bad "目录噪音期间写了 SMC $(( w2 - w1 )) 次"
+  # 反向对照：真改配置必须恰好触发重载（否则上面的 0 可能是监视失效的假绿）
+  set_key percent 61; wait_reload
+  r3="$(reload_count)"
+  [ "${r3}" -gt "${r2}" ] && ok "⭐反向：真改配置触发了重载（$(( r3 - r2 )) 次）—— 监视没失效" \
+                          || bad "真改配置也没重载 —— 目录监视失效"
+  # 🩸「重载了」是代理量：初版这条绿着，而 SMC 目标根本没变（容差吃掉了 50 RPM 的改动）
+  [ "$(fan_target 0)" = "$(exp_target 0 61)" ] && ok "⭐SMC 目标真的变成 $(exp_target 0 61)（判硬件事实，不判「重载了」）" \
+                                 || bad "重载了但 SMC 目标是 $(fan_target 0)，不是 $(exp_target 0 61)"
+  e_before="$(stat_num external_overrides)"
+  # 原地写（不改目录项）：只能靠巡检时的 stat 兜底 —— 必须在一个巡检周期内生效
+  sed 's/^percent = .*/percent = 59/' "${CONF}" > /tmp/e2e-inplace.conf && cat /tmp/e2e-inplace.conf > "${CONF}"
+  sleep 12
+  [ "$(fan_target 0)" = "$(exp_target 0 59)" ] && ok "原地写配置（cp/nano 式）在一个巡检周期内生效" \
+                                 || bad "原地写配置 12s 后仍未生效（目标 $(fan_target 0)）"
+  [ "$(stat_num external_overrides)" = "${e_before}" ] \
+    && ok "[回归] 使用者原地改配置**不**被算成外部抢写（否则 3 次就错误让步）" \
+    || bad "原地改配置被算成外部改动（${e_before} → $(stat_num external_overrides)）"
+  set_key percent 61; wait_reload
+else
+  skip "真守护未运行，跳过 R15"
+fi
+
+grp "回归 R16 —— 与别的风扇程序抢写（2026-09-14 事故形态：3300↔2500 拉锯）"
+# ⭐ 用 fanctl 扮演「别的风扇程序」反复改目标，FanPilot 必须：先纠正、再让步、绝不无限拉锯
+if [ "${DAEMON_UP}" = "1" ]; then
+  e0="$(stat_num external_overrides)"
+  "${FANCTL}" rpm 0 2222 >/dev/null 2>&1
+  sleep 12
+  [ "$(fan_target 0)" = "$(exp_target 0 61)" ] && ok "外部改动被下一次巡检纠正（2222 → $(exp_target 0 61)）" \
+                                 || bad "外部改动未被纠正（目标 $(fan_target 0)）"
+  e1="$(stat_num external_overrides)"
+  [ "${e1:-0}" -gt "${e0:-0}" ] && ok "外部改动被计数并留痕（${e0}→${e1}）" || bad "外部改动未计数"
+  "${FANCTL}" rpm 0 2222 >/dev/null 2>&1; sleep 11
+  "${FANCTL}" rpm 0 2222 >/dev/null 2>&1; sleep 11
+  m="$(stat_str mode)"
+  [ "${m}" = "yielded_external_writer" ] && ok "⭐10 分钟内第 3 次被改 → 让步（mode=${m}），不再拉锯" \
+                                         || bad "第 3 次被改后 mode=${m} —— 会无限互相纠正"
+  w1="$(stat_num writes_total)"; "${FANCTL}" rpm 0 2333 >/dev/null 2>&1; sleep 11; w2="$(stat_num writes_total)"
+  [ "${w2}" = "${w1}" ] && ok "让步期间再被改也写 SMC 0 次" || bad "让步期间仍写了 $(( w2 - w1 )) 次"
+  # 使用者显式改设置 = 结束让步
+  set_key percent 60; wait_reload
+  [ "$(stat_str mode)" = "normal" ] && [ "$(fan_target 0)" = "$(exp_target 0 60)" ] \
+    && ok "使用者改设置后立刻结束让步并接管（目标 $(fan_target 0)）" \
+    || bad "改设置后仍在让步（mode=$(stat_str mode)）"
+else
+  skip "真守护未运行，跳过 R16"
+fi
+
+grp "回归 R17 —— 菜单栏 App 每次刷新都 fork launchctl（1.x：≈4.3 万次进程/天）"
+SW="${ROOT}/app/Sources/FanPilotMenu/main.swift"
+calls="$(nocomment_swift "${SW}" | grep -n 'refreshLoginItem()' | grep -vc 'func refreshLoginItem' || true)"
+inopen="$(nocomment_swift "${SW}" | awk '/func menuWillOpen/{f=1} f&&/refreshLoginItem\(\)/{c++} f&&/^    }/{f=0} END{print c+0}')"
+intoggle="$(nocomment_swift "${SW}" | awk '/func toggleLogin/{f=1} f&&/refreshLoginItem\(\)/{c++} f&&/^    }/{f=0} END{print c+0}')"
+[ "${calls}" = "$(( inopen + intoggle ))" ] && [ "${inopen}" = "1" ] \
+  && ok "会 fork 子进程的自启查询只在打开菜单/点开关时调用（${calls} 处）" \
+  || bad "refreshLoginItem 在别处被调用（共 ${calls}，菜单打开 ${inopen}，开关 ${intoggle}）—— 又会每次刷新 fork"
+iv="$(nocomment_swift "${SW}" | sed -n 's/.*Timer(timeInterval: \([0-9.]*\).*/\1/p' | head -1)"
+awk -v v="${iv:-0}" 'BEGIN{exit !(v>=10)}' && ok "App 刷新间隔 ${iv}s ≥ 10s（= 守护巡检间隔）" \
+                                          || bad "App 刷新间隔 ${iv}s 过短 —— 只是重复读同一份文件"
+[ "$(nocomment_swift "${SW}" | grep -c 'guard key != lastTitle')" != "0" ] \
+  && ok "菜单栏内容不变时不重绘" || bad "每次刷新都重绘菜单栏图像"
+[ "$(nocomment_swift "${SW}" | grep -c 'a.window.level = .floating')" != "0" ] \
+  && ok "弹窗先置顶再 runModal（不会藏到窗口后面让菜单「卡死」）" || bad "裸 runModal"
 
 grp "回归 R14 —— 测试脚本自己留下孤儿守护（2026-09-14 真事故）"
 # 事故：R4 裸启动一个 fanpilotd（真守护当时已停 ⇒ flock 无人占 ⇒ 它成了真守护并阻塞）；

@@ -78,13 +78,18 @@ fi
 echo
 echo "── 冲突检查（两个程序同时写 SMC 会互相抢，且不报错）"
 CONFLICT=0
-for proc in "Macs Fan Control" smcFanControl TGPro "iStat Menus"; do
+for proc in "Macs Fan Control" smcFanControl TGPro "iStat Menus" FanControl; do
   pgrep -x "${proc}" >/dev/null 2>&1 && { bad "正在运行：${proc}"; CONFLICT=1; }
 done
-for path in "/Applications/Macs Fan Control.app" "/Applications/smcFanControl.app" \
-            "/Applications/TG Pro.app" \
-            /Library/PrivilegedHelperTools/com.crystalidea.macsfancontrol.smcwrite; do
-  [ -e "${path}" ] && { bad "已安装：${path}"; CONFLICT=1; }
+# 阻断：已装好、随时能写 SMC 的 root helper
+[ -e /Library/PrivilegedHelperTools/com.crystalidea.macsfancontrol.smcwrite ] \
+  && { bad "已安装 root helper：/Library/PrivilegedHelperTools/com.crystalidea.macsfancontrol.smcwrite"; CONFLICT=1; }
+# 提醒：App 本身（没在跑就不写，但一打开 / 登录自启就会写，还可能重装 helper）
+# 🩸 2026-10-28 实测：MFC 装在 ~/Applications（用户目录），只查 /Applications 会漏
+for app in "Macs Fan Control" smcFanControl "TG Pro" "Fan Control"; do
+  for d in /Applications "${HOME}/Applications"; do
+    [ -e "${d}/${app}.app" ] && warn "已安装 ${d}/${app}.app —— 没在跑就不冲突；打开它（或它登录自启）就会和 FanPilot 抢写"
+  done
 done
 [ "${CONFLICT}" = "0" ] && ok "无其它风扇控制软件"
 
