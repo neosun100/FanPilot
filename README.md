@@ -13,8 +13,8 @@
   <a href="https://github.com/neosun100/FanPilot/releases/latest"><img alt="release" src="https://img.shields.io/github/v/release/neosun100/FanPilot?style=flat-square&color=0F4C75"/></a>
   <img alt="platform" src="https://img.shields.io/badge/macOS-13%2B%20·%20Apple%20Silicon-0F4C75?style=flat-square&logo=apple&logoColor=white"/>
   <img alt="lang" src="https://img.shields.io/badge/C%20%2B%20Swift-零依赖-3AAFA9?style=flat-square"/>
-  <img alt="tests" src="https://img.shields.io/badge/tests-162%20passing-3AAFA9?style=flat-square"/>
-  <img alt="mutations" src="https://img.shields.io/badge/mutations-8%2F8%20killed-3AAFA9?style=flat-square"/>
+  <img alt="tests" src="https://img.shields.io/badge/tests-170%20passing-3AAFA9?style=flat-square"/>
+  <img alt="mutations" src="https://img.shields.io/badge/mutations-10%2F10%20killed-3AAFA9?style=flat-square"/>
   <img alt="smc writes" src="https://img.shields.io/badge/稳态写%20SMC-0%20次-2E7D32?style=flat-square"/>
   <a href="LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square"/></a>
 </p>
@@ -261,6 +261,7 @@ rm -rf /Applications/FanPilot.app
 | 边界 | 为什么 |
 |---|---|
 | **睡眠期间不控制风扇** | 睡眠时用户态被冻结，任何程序都没有执行机会；FanPilot 睡前交还出厂固件，这是唯一安全的做法 |
+| **接着外接显示器 + 电源时合盖，风扇照常转** | 这是 macOS 的「合盖模式」：机器**没有睡**，仍在工作，FanPilot 照常定速。只有真睡眠才交还固件 |
 | **没有公证签名** | 没有 Apple Developer ID ⇒ 只能 ad-hoc；需要你显式解除隔离，或从源码编译 |
 | **不能与其它风扇软件共存** | 两个程序写同一组寄存器、互相不知情、都不报错。FanPilot 会检测并让步，但不会和它们「打」 |
 | **不再提供按温度自动调速** | 2.0 删除。自适应曲线 ≈ 2.3 万次/天写 SMC，且使用者只需要定速 —— 见 [CHANGELOG 2.0.0](CHANGELOG.md) |
@@ -333,15 +334,20 @@ SMC 的 `F*md=1`（手动）与 `F*Tg`（目标）是**锁存**寄存器 —— 
 | 正常退出 / `SIGTERM` / 卸载 | 写 `F*md=0` 交还固件 |
 | `SIGKILL` / 崩溃 | 风扇保持锁存的定速值（安全方向）；launchd 10 s 后拉起新实例 |
 | 传感器读取失败 | 立即交还固件（只在边沿写一次），不用陈旧值继续控制 |
-| 系统睡眠 / 合盖 | `kIOMessageSystemWillSleep` → 交还固件；唤醒后重新接管 |
+| 系统睡眠 / 合盖 | `kIOMessageSystemWillSleep` → 交还固件；**只在完全唤醒时**重新接管 |
+| 睡眠中的 DarkWake（维护唤醒） | 系统能力没有「显示」位 ⇒ **不接管**，风扇继续归固件。本机实测睡眠时约每小时一次（`rtc/Maintenance`，5~9 s），Power Nap 关着也有 |
 
 🩸 **睡眠那一条曾经完全不存在**：2026-09-14 合盖睡眠 44 分钟，风扇按睡前的 3822 RPM 一直转。
 根因是把「失效」等同于**进程死掉**，漏了「进程活着但被冻结」—— 冻结比死掉更危险：死掉有 `KeepAlive` 接管，
 冻结让一条陈旧指令在硬件寄存器里无限期生效。这条最难测的路径有可离线触发的判据：
 
 ```bash
-sudo fanpilotd --selftest-pm     # 投喂一条 WillSleep，回读 F*md 是否真变 0
+sudo fanpilotd --selftest-pm     # 投喂 WillSleep → 回读 F*md 变 0；再注入 DarkWake 投喂「已唤醒」→ 风扇必须仍归固件
 ```
+
+🩸 **DarkWake 那一条是 2.1.1 才补的**：之前收到「已唤醒」就接管，而睡眠里的维护唤醒也会发这条通知
+⇒ 合盖放包里每小时会把风扇冲向定速一次。现在接管的判据是 `IOPMrootDomain` 的 `System Capabilities` 含显示位（完全唤醒 = 15，DarkWake = 0x09）。
+DarkWake 之后掀盖（转为完全唤醒）时系统不一定再发通知，所以每次巡检都会查这个能力位，≤ 5 s 内接上。
 
 ---
 
@@ -375,17 +381,17 @@ grep writes_total /var/run/fanpilot.status.json; sleep 60; grep writes_total /va
 ## 测试
 
 ```bash
-make test     # 单元 60 + 验收 30 + E2E/回归 72 = 162 项
+make test     # 单元 66 + 验收 30 + E2E/回归 74 = 170 项
 ```
 
 | 层 | 守什么 | 守不住什么 |
 |---|---|---|
-| `tests/unit_logic.c` · **60** | `fanlogic.h` 全部纯逻辑：配置解析（含 NaN / 垃圾值 / 注释）、硬夹、百分比折算、紧急回差、令牌桶、抢写让步 | IOKit 交互 |
+| `tests/unit_logic.c` · **66** | `fanlogic.h` 全部纯逻辑：配置解析（含 NaN / 垃圾值 / 注释）、硬夹、百分比折算、紧急回差、令牌桶、抢写让步 | IOKit 交互 |
 | `install/verify.sh` · **30** | 装好后的事实：运行状态、失效安全、**稳态 60 秒 0 写入**、资源预算、重启节流、反向断言 | 用户路径 |
-| `tests/e2e.sh` · **72** | 真机用户路径 + 按真实 bug 编号的回归，含活体：改档即刻生效、目录噪音不触发重载、原地编辑 ≤ 1 周期生效、被抢写时让步、App 单实例 | 真实合盖（见路线图） |
+| `tests/e2e.sh` · **74** | 真机用户路径 + 按真实 bug 编号的回归，含活体：改档即刻生效、目录噪音不触发重载、原地编辑 ≤ 1 周期生效、被抢写时让步、App 单实例 | 真实合盖（见路线图） |
 
 关键判据都做过**变异验证**：把修过的缺陷改回去（容差 50、桶容量 16、去掉回差、永远重写、去 NaN 防护、紧急不打满、让步失效、不剥注释），
-测试必须变红 —— **8/8 变红**。
+测试必须变红 —— **8/8 变红**；另有 2 条接线级变异：去掉「重挂文件监听」⇒ R19 红，DarkWake 改回「无条件接管」⇒ `--selftest-pm` fail。
 
 **反向断言和正向断言一样重要**：越界百分比必须被夹、第二个实例必须启动失败、恶意配置的安全阈值必须被夹住、
 「0 次写入」必须伴随「巡检仍在进行」（否则可能是守护卡死的假绿）。
