@@ -190,6 +190,16 @@ static void test_storm_guards(void){
     ok(writes <= 2 * 3 * (86400 / 1800 + 1), "被持续抢写 1 天：纠正写入 ≤ ~294 次，且不拉锯");
 }
 
+static void test_darkwake(void){
+    group("🔴 合盖：DarkWake 不接管，完全唤醒才接管");
+    ok(fl_should_take_over(15) == 1, "完全唤醒（CPU|显示|音频|网络 = 15）→ 接管");
+    ok(fl_should_take_over(0x0B) == 1, "有显示位即接管（0x0B）");
+    ok(fl_should_take_over(0x09) == 0, "⭐DarkWake（CPU|网络 = 0x09，无显示位）→ 不接管，风扇继续归固件");
+    ok(fl_should_take_over(0x01) == 0, "只有 CPU → 不接管");
+    ok(fl_should_take_over(0) == 0, "能力为 0（睡眠中）→ 不接管");
+    ok(fl_should_take_over(-1) == 1, "读不到能力 → 接管（宁可接管也不静默失效；调用方留痕）");
+}
+
 int main(void){
     test_parse();
     test_clamp();
@@ -197,6 +207,7 @@ int main(void){
     test_emergency();
     test_rewrite();
     test_storm_guards();
+    test_darkwake();
     printf("\n═══════════════════════════════\n  通过 %d · 失败 %d\n", g_pass, g_fail);
     if (g_fail == 0) printf("  ✅ 全部通过\n");
     return g_fail == 0 ? 0 : 1;

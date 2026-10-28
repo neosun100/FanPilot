@@ -168,7 +168,8 @@ static int    g_failsafe = 0;
 static int    g_starved = 0;       // 写入预算耗尽中（边沿留痕用）
 static fl_bucket g_bucket;
 static fl_fight  g_fight;      // 传感器读失败 ⇒ 已交还固件
-static int    g_sleeping = 0;      // WillSleep 之后、唤醒之前：绝不重新接管
+static int    g_sleeping = 0;      // WillSleep 之后、完全唤醒之前：绝不重新接管
+static int    g_woke = 0;          // WillSleep 之后是否收到过唤醒通知（DarkWake 也算）
 static double g_sleep_at = 0;      // 进入 g_sleeping 时的「醒着时钟」（见 awake_now）
 static int    g_stop = 0;
 static int    g_reload = 0;
@@ -220,8 +221,27 @@ static int read_temps(double *hottest, double *average, double *coolest){
 // 交还写入也计入 writes_total —— 菜单里的「启动以来共写 N 次」若漏掉睡眠/退出时的交还，数字就偏小
 // （不受令牌桶限制：这是安全方向的写入，且只在边沿发生）
 static void fans_to_firmware(void){
-    for (int f = 0; f < NFAN; f++)
+    for (int f = 0; f < NFAN; f++) {
+        // 已经是固件控制就不写：DarkWake 结束重新睡眠时也会走到这里，每次白写 2 次（约每小时一次）
+        int md = -1;
+        if (key_read_u8(&g_md[f], &md) == 0 && md == 0) continue;
         if (key_write_u8(&g_md[f], 0) == 0) { g_writes++; g_last_write = time(NULL); }
+    }
+}
+
+// 当前系统能力（IOPMrootDomain 的 "System Capabilities"）；读不到返回 -1。
+// 完全唤醒 = 15（CPU|显示|音频|网络）；DarkWake 没有显示位（见 fanlogic.h 的 fl_should_take_over）。
+static long g_caps_override = -2;   // 仅 --selftest-pm 用：-2 = 不覆盖，读真实值
+static long system_caps(void){
+    if (g_caps_override != -2) return g_caps_override;
+    static io_service_t root = IO_OBJECT_NULL;
+    if (!root) root = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"));
+    if (!root) return -1;
+    CFTypeRef v = IORegistryEntryCreateCFProperty(root, CFSTR("System Capabilities"), kCFAllocatorDefault, 0);
+    long caps = -1;
+    if (v && CFGetTypeID(v) == CFNumberGetTypeID()) CFNumberGetValue((CFNumberRef)v, kCFNumberLongType, &caps);
+    if (v) CFRelease(v);
+    return caps;
 }
 
 // ───────────────────────── 状态文件 ─────────────────────────
@@ -259,11 +279,19 @@ static void check_once(const char *why_in){
     const char *why = why_in;
     double z[NFAN] = {0, 0};
     if (g_sleeping) {
-        // 🩸 WillSleep 已交还固件；离真正睡着还有几秒。若此时巡检把 md 写回 1，
-        //    就又回到「带着手动指令睡一整夜」那个 bug（v1.2.0 修过的）。
-        if (awake_now() - g_sleep_at < 30) return;
-        logmsg( "⚠️ WillSleep 后醒着已超 30s 却没收到唤醒通知 —— 视为已唤醒，重新接管\n");
+        // 🩸 两个事实都成立才接管：
+        //  ① 确实醒过（收到过唤醒通知）；或通知丢了但醒着已超 30 s —— 时长只当「去查」的触发器。
+        //     没有①的话：WillSleep 之后、真正睡着之前的几秒里能力位仍是 15，会把 md 写回 1，
+        //     回到「带着手动指令睡一整夜」（v1.2.0 修过的）
+        //  ② 系统能力含显示位（完全唤醒）。DarkWake 只有 CPU/网络位 ⇒ 风扇继续归固件（2026-10-28 修）
+        //     ⭐ DarkWake → 完全唤醒（掀盖）时系统不一定再发唤醒通知 ⇒ 靠这里每次巡检查能力位接上
+        if (!g_woke && awake_now() - g_sleep_at < 30) return;
+        long caps = system_caps();
+        if (!fl_should_take_over(caps)) return;
+        if (caps < 0) logmsg("⚠️ 读不到系统能力（IOPMrootDomain \"System Capabilities\"）—— 无法区分 DarkWake，按完全唤醒接管\n");
+        else          logmsg("完全唤醒（系统能力 0x%lx）→ 重新接管风扇\n", caps);
         g_sleeping = 0;
+        why = "唤醒";
     }
 
     double hot, avg, cool;
@@ -381,14 +409,19 @@ static void pm_apply(natural_t type){
     case kIOMessageSystemWillSleep:
         fans_to_firmware();
         g_sleeping = 1;
+        g_woke = 0;
         g_sleep_at = awake_now();
         break;
     // 只认 HasPoweredOn：WillPowerOn 时 SMC 可能还没就绪，读失败会白走一趟失效安全
     case kIOMessageSystemHasPoweredOn:
         if (g_sleeping) {
-            g_sleeping = 0;
-            logmsg( "系统唤醒 → 重新接管风扇\n");
-            check_once("唤醒");
+            g_woke = 1;
+            long caps = system_caps();
+            if (fl_should_take_over(caps)) {
+                check_once("唤醒");     // 由 check_once 的睡眠闸门统一判定与留痕（单一来源）
+            } else {
+                logmsg("DarkWake（系统能力 0x%lx，无显示）→ 不接管，风扇继续归固件\n", caps);
+            }
         }
         break;
     default:
@@ -510,7 +543,22 @@ int main(int argc, char **argv){
             if (a != 0) okall = 0;
         }
         printf("sleeping_flag=%d\n", g_sleeping);
-        int pass = okall && reg == 0 && g_sleeping;
+        long caps = system_caps();
+        printf("system_caps=%ld\ntake_over_now=%d\n", caps, fl_should_take_over(caps));
+
+        // ── DarkWake 接线：注入「无显示」能力，投喂「已唤醒」⇒ 风扇必须仍归固件（md 仍为 0）
+        //    判效果（回读 SMC），不判「我调了函数」。合盖放包里每小时一次的 DarkWake 就靠这一条。
+        g_caps_override = 0x09;                       // CPU | 网络，无显示
+        pm_apply(kIOMessageSystemHasPoweredOn);
+        int dw_ok = g_sleeping == 1;
+        for (int f = 0; f < NFAN; f++) {
+            int m; if (key_read_u8(&g_md[f], &m) != 0) m = -1;
+            printf("darkwake_fan%d_md=%d\n", f, m);
+            if (m != 0) dw_ok = 0;
+        }
+        g_caps_override = -2;
+        printf("darkwake_stays_firmware=%d\n", dw_ok);
+        int pass = okall && reg == 0 && g_sleeping && dw_ok;
         printf("result=%s\n", pass ? "pass" : "fail");
         IOServiceClose(g_conn);
         return pass ? 0 : 1;

@@ -161,6 +161,18 @@ static inline int fl_needs_rewrite(int md_now, double tg_now, double target){
     return d > FL_REWRITE_TOLERANCE;
 }
 
+// ── 睡眠期间要不要接管：只看「系统能力」这个事实 ─────────────────────
+// 🩸 2026-10-28：本机睡眠时约每小时一次 DarkWake（rtc/Maintenance，用电池，5~9 s），Power Nap 关着也有。
+//    旧逻辑收到「已唤醒」就接管 ⇒ 合盖放包里每小时把风扇冲向定速一次；
+//    「醒着超过 30 s 就当已唤醒」的时长兜底在长 DarkWake 里也会误接管。
+// ⇒ 只在系统能力含**显示**位（完全唤醒，盖子开着 / 用户在用）时接管；DarkWake 只有 CPU/网络位。
+//    caps < 0 = 读不到：按「接管」处理（否则将来接口变了，FanPilot 会在每次唤醒后静默失效），调用方必须留痕。
+#define FL_CAP_GRAPHICS 0x02          // = IOPM.h 的 kIOPMSystemCapabilityGraphics
+static inline int fl_should_take_over(long caps){
+    if (caps < 0) return 1;
+    return (caps & FL_CAP_GRAPHICS) != 0;
+}
+
 // ── 写入令牌桶 ────────────────────────────────────────────────────
 // 每次 SMC 写入取 1 枚；按 FL_WRITE_PER_HOUR 匀速回补，最多存 FL_WRITE_BURST 枚。
 // 取不到 ⇒ 本次**不写**（调用方留痕）。时间用「醒着时钟」，睡眠不回补也不消耗。
