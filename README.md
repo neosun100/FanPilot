@@ -13,7 +13,7 @@
   <a href="https://github.com/neosun100/FanPilot/releases/latest"><img alt="release" src="https://img.shields.io/github/v/release/neosun100/FanPilot?style=flat-square&color=0F4C75"/></a>
   <img alt="platform" src="https://img.shields.io/badge/macOS-13%2B%20·%20Apple%20Silicon-0F4C75?style=flat-square&logo=apple&logoColor=white"/>
   <img alt="lang" src="https://img.shields.io/badge/C%20%2B%20Swift-零依赖-3AAFA9?style=flat-square"/>
-  <img alt="tests" src="https://img.shields.io/badge/tests-159%20passing-3AAFA9?style=flat-square"/>
+  <img alt="tests" src="https://img.shields.io/badge/tests-162%20passing-3AAFA9?style=flat-square"/>
   <img alt="mutations" src="https://img.shields.io/badge/mutations-8%2F8%20killed-3AAFA9?style=flat-square"/>
   <img alt="smc writes" src="https://img.shields.io/badge/稳态写%20SMC-0%20次-2E7D32?style=flat-square"/>
   <a href="LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square"/></a>
@@ -375,14 +375,14 @@ grep writes_total /var/run/fanpilot.status.json; sleep 60; grep writes_total /va
 ## 测试
 
 ```bash
-make test     # 单元 60 + 验收 30 + E2E/回归 69 = 159 项
+make test     # 单元 60 + 验收 30 + E2E/回归 72 = 162 项
 ```
 
 | 层 | 守什么 | 守不住什么 |
 |---|---|---|
 | `tests/unit_logic.c` · **60** | `fanlogic.h` 全部纯逻辑：配置解析（含 NaN / 垃圾值 / 注释）、硬夹、百分比折算、紧急回差、令牌桶、抢写让步 | IOKit 交互 |
 | `install/verify.sh` · **30** | 装好后的事实：运行状态、失效安全、**稳态 60 秒 0 写入**、资源预算、重启节流、反向断言 | 用户路径 |
-| `tests/e2e.sh` · **69** | 真机用户路径 + 按真实 bug 编号的回归，含活体：改档即刻生效、目录噪音不触发重载、原地编辑 ≤ 1 周期生效、被抢写时让步、App 单实例 | 真实合盖（见路线图） |
+| `tests/e2e.sh` · **72** | 真机用户路径 + 按真实 bug 编号的回归，含活体：改档即刻生效、目录噪音不触发重载、原地编辑 ≤ 1 周期生效、被抢写时让步、App 单实例 | 真实合盖（见路线图） |
 
 关键判据都做过**变异验证**：把修过的缺陷改回去（容差 50、桶容量 16、去掉回差、永远重写、去 NaN 防护、紧急不打满、让步失效、不剥注释），
 测试必须变红 —— **8/8 变红**。
