@@ -64,6 +64,16 @@ typedef struct {
 // 缓存的键句柄：keyinfo 只在启动时问一次（省掉每次一个 IOKit 往返）
 typedef struct { char name[5]; uint32_t size, type; uint8_t attr; int valid; } Key;
 
+// 日志统一加时间戳。🩸 2026-10-28：e2e R13 失败时日志里只有先后顺序、没有时间，
+//    无法确证「那次写入是使用者在测试中途点了菜单」—— 诊断只能靠推断。
+#include <stdarg.h>
+static void logmsg(const char *fmt, ...){
+    char ts[32]; time_t now = time(NULL); struct tm tmv;
+    strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", localtime_r(&now, &tmv));
+    fprintf(stderr, "[%s] ", ts);
+    va_list ap; va_start(ap, fmt); vfprintf(stderr, fmt, ap); va_end(ap);
+}
+
 static io_connect_t g_conn = 0;
 static fl_cfg g_cfg;
 
@@ -129,16 +139,16 @@ static int key_read_u8(const Key *k, int *v){
 static int key_write(const Key *k, const uint8_t *data, uint32_t len){
     if (!k->valid) return -1;
     if (!is_writable_key(k->name)) {                       // S1
-        fprintf(stderr, "⛔ 拒绝写非白名单键 %s\n", k->name); return -2; }
+        logmsg( "⛔ 拒绝写非白名单键 %s\n", k->name); return -2; }
     if (k->size != len) {
-        fprintf(stderr, "⛔ %s 长度不符 (SMC=%u, 给=%u)\n", k->name, k->size, len); return -2; }
+        logmsg( "⛔ %s 长度不符 (SMC=%u, 给=%u)\n", k->name, k->size, len); return -2; }
     if (!(k->attr & 0x40)) {                               // 实测: 0x40 = 可写
-        fprintf(stderr, "⛔ %s 无可写位 (attr=0x%02x)\n", k->name, k->attr); return -2; }
+        logmsg( "⛔ %s 无可写位 (attr=0x%02x)\n", k->name, k->attr); return -2; }
     SData in, out; memset(&in, 0, sizeof in);
     in.key = s2k(k->name); in.data8 = CMD_WRITE_BYTES; in.info.size = len;
     memcpy(in.bytes, data, len > 32 ? 32 : len);
     if (smc_call(&in, &out) != KERN_SUCCESS || out.result != 0) {
-        fprintf(stderr, "✗ 写 %s 失败 result=%u\n", k->name, out.result); return -1; }
+        logmsg( "✗ 写 %s 失败 result=%u\n", k->name, out.result); return -1; }
     return 0;
 }
 static int key_write_flt(const Key *k, double v){ float f=(float)v; uint8_t b[4];
@@ -220,7 +230,7 @@ static void write_status(const char *mode, double hot, double avg, double cool,
                          const double ac[], const double tg[]){
     char tmp[512]; snprintf(tmp, sizeof tmp, "%s.tmp", g_status_path);
     FILE *fp = fopen(tmp, "w");
-    if (!fp) { fprintf(stderr, "⚠️ 写不了状态文件 %s: %s\n", tmp, strerror(errno)); return; }
+    if (!fp) { logmsg( "⚠️ 写不了状态文件 %s: %s\n", tmp, strerror(errno)); return; }
     fprintf(fp,
       "{\n  \"ts\": %ld,\n  \"mode\": \"%s\",\n"
       "  \"temp_hottest_c\": %.2f,\n  \"temp_average_c\": %.2f,\n  \"temp_coolest_c\": %.2f,\n"
@@ -252,7 +262,7 @@ static void check_once(const char *why_in){
         // 🩸 WillSleep 已交还固件；离真正睡着还有几秒。若此时巡检把 md 写回 1，
         //    就又回到「带着手动指令睡一整夜」那个 bug（v1.2.0 修过的）。
         if (awake_now() - g_sleep_at < 30) return;
-        fprintf(stderr, "⚠️ WillSleep 后醒着已超 30s 却没收到唤醒通知 —— 视为已唤醒，重新接管\n");
+        logmsg( "⚠️ WillSleep 后醒着已超 30s 却没收到唤醒通知 —— 视为已唤醒，重新接管\n");
         g_sleeping = 0;
     }
 
@@ -261,20 +271,20 @@ static void check_once(const char *why_in){
         // 降级留痕：读不到温度就交还固件，绝不在看不见温度时维持手动转速
         // 只在**边沿**交还一次：持续失败时每次巡检都写 md=0 是无意义的重复写入
         if (!g_failsafe) {
-            fprintf(stderr, "⚠️ 传感器读取失败 → 交还固件自动控制\n");
+            logmsg( "⚠️ 传感器读取失败 → 交还固件自动控制\n");
             fans_to_firmware();
         }
         g_failsafe = 1;
         write_status("failsafe_sensor_read_failed", -1, -1, -1, z, z);
         return;
     }
-    if (g_failsafe) { fprintf(stderr, "传感器恢复 → 重新接管\n"); why = "恢复"; }
+    if (g_failsafe) { logmsg( "传感器恢复 → 重新接管\n"); why = "恢复"; }
     g_failsafe = 0;
 
     int em = fl_emergency_next(&g_cfg, g_emergency,
                                fl_pick_temp(g_cfg.emergency_source, hot, avg, cool));
     if (em != g_emergency)          // 边沿触发留痕，不按巡检刷屏
-        fprintf(stderr, em ? "🔥 %s温度 %.1f°C ≥ %.0f°C → 紧急打满\n"
+        logmsg( em ? "🔥 %s温度 %.1f°C ≥ %.0f°C → 紧急打满\n"
                            : "紧急解除（%s温度 %.1f°C < %.0f°C-5）→ 回到定速\n",
                 fl_src_name(g_cfg.emergency_source),
                 fl_pick_temp(g_cfg.emergency_source, hot, avg, cool), g_cfg.emergency_temp);
@@ -293,10 +303,10 @@ static void check_once(const char *why_in){
             // 定时巡检里发现不符 = 有别的东西改了寄存器（别的风扇软件 / SMC 复位）
             if (!strcmp(why, "巡检")) {
                 g_external++;
-                fprintf(stderr, "⚠️ 风扇%d 被外部改动（md=%d Tg=%.0f，累计 %ld 次）\n",
+                logmsg( "⚠️ 风扇%d 被外部改动（md=%d Tg=%.0f，累计 %ld 次）\n",
                         f, md, tg_now, g_external);
                 if (fl_fight_note(&g_fight, now)) {
-                    fprintf(stderr, "🛑 10 分钟内被外部改动 %d 次 —— 有别的程序在写风扇。"
+                    logmsg( "🛑 10 分钟内被外部改动 %d 次 —— 有别的程序在写风扇。"
                                     "FanPilot 让步 %.0f 分钟（不纠正、不写），避免互相拉锯\n",
                             FL_FIGHT_COUNT, FL_FIGHT_YIELD / 60);
                     yielding = 1;
@@ -306,7 +316,7 @@ static void check_once(const char *why_in){
             // 🔴 写入令牌桶：防 bug 导致的写入风暴。紧急打满不受限（它自身被回差限频）
             int n = (md != 1) + 1;
             if (!em && !fl_bucket_take(&g_bucket, now, n)) {
-                if (!g_starved) fprintf(stderr, "🛑 SMC 写入预算耗尽（>%.0f 次/小时）—— 暂停写入，"
+                if (!g_starved) logmsg( "🛑 SMC 写入预算耗尽（>%.0f 次/小时）—— 暂停写入，"
                                                 "这说明有 bug 或外部抢写，请看上面的日志\n",
                                         FL_WRITE_PER_HOUR);
                 starved = 1;
@@ -320,18 +330,18 @@ static void check_once(const char *why_in){
         if (key_read_flt(&g_ac[f], &ac[f]) != 0) ac[f] = -1;
         tg[f] = target;
     }
-    if (g_starved && !starved) fprintf(stderr, "写入预算恢复\n");
+    if (g_starved && !starved) logmsg( "写入预算恢复\n");
     g_starved = starved;
     write_status(yielding ? "yielded_external_writer" : starved ? "write_budget_exhausted"
                  : em ? "emergency" : "normal", hot, avg, cool, ac, tg);
 }
 
 static void log_effective(void){
-    fprintf(stderr, "生效配置: 定速 %.1f%% · 巡检 %.0fs · 紧急 %.0f°C（%s，回差 %.0f°C）\n",
+    logmsg( "生效配置: 定速 %.1f%% · 巡检 %.0fs · 紧急 %.0f°C（%s，回差 %.0f°C）\n",
             g_cfg.percent, g_cfg.check_interval, g_cfg.emergency_temp,
             fl_src_name(g_cfg.emergency_source), FL_EMERG_HYSTERESIS);
     for (int f = 0; f < NFAN; f++)
-        fprintf(stderr, "  风扇%d → %.0f RPM（硬件 %.0f~%.0f）\n", f,
+        logmsg( "  风扇%d → %.0f RPM（硬件 %.0f~%.0f）\n", f,
                 fl_fan_target(&g_cfg, g_fmin[f], g_fmax[f], 0), g_fmin[f], g_fmax[f]);
 }
 
@@ -351,7 +361,7 @@ static int cfg_changed(void){
 
 static void reload_config(void){
     if (fl_cfg_load(g_cfg_path, &g_cfg) != 0)
-        fprintf(stderr, "⚠️ 读不到配置 %s —— 使用默认值（%.0f%%）\n",
+        logmsg( "⚠️ 读不到配置 %s —— 使用默认值（%.0f%%）\n",
                 g_cfg_path, FL_DEFAULT_PCT);
     log_effective();
 }
@@ -377,7 +387,7 @@ static void pm_apply(natural_t type){
     case kIOMessageSystemHasPoweredOn:
         if (g_sleeping) {
             g_sleeping = 0;
-            fprintf(stderr, "系统唤醒 → 重新接管风扇\n");
+            logmsg( "系统唤醒 → 重新接管风扇\n");
             check_once("唤醒");
         }
         break;
@@ -399,7 +409,7 @@ static void pm_callback(void *refcon, io_service_t svc, natural_t type, void *ar
 static int pm_register(void){
     g_pm_root = IORegisterForSystemPower(NULL, &g_pm_port, pm_callback, &g_pm_notifier);
     if (g_pm_root == MACH_PORT_NULL || g_pm_port == NULL) {
-        fprintf(stderr, "⚠️ 电源通知注册失败 —— 睡眠时将无法交还固件（风扇可能整夜转）\n");
+        logmsg( "⚠️ 电源通知注册失败 —— 睡眠时将无法交还固件（风扇可能整夜转）\n");
         g_pm_port = NULL;
         return -1;
     }
@@ -435,7 +445,7 @@ static int watch_config_dir(void){
     const char *dir = dirname(buf);
     int fd = open(dir, O_EVTONLY);
     if (fd < 0) {
-        fprintf(stderr, "⚠️ 无法监视配置目录 %s: %s —— 改配置需 sudo killall -HUP fanpilotd\n",
+        logmsg( "⚠️ 无法监视配置目录 %s: %s —— 改配置需 sudo killall -HUP fanpilotd\n",
                 dir, strerror(errno));
         return -1;
     }
@@ -461,7 +471,7 @@ static int init_fan_keys(int need_write){
         if (key_init(&mx, n) != 0 || key_read_flt(&mx, &g_fmax[f]) != 0) g_fmax[f] = -1;
         // 🔴 读不到硬件范围就不写：没有上下限就无法保证目标合法（1.x 用 4000 兜底，删了）
         if (need_write && (g_fmin[f] <= 0 || g_fmax[f] <= g_fmin[f] || !g_md[f].valid || !g_tg[f].valid)) {
-            fprintf(stderr, "✗ 风扇%d 的 SMC 键不全或范围读不到（Mn=%.0f Mx=%.0f）—— 拒绝控制\n",
+            logmsg( "✗ 风扇%d 的 SMC 键不全或范围读不到（Mn=%.0f Mx=%.0f）—— 拒绝控制\n",
                     f, g_fmin[f], g_fmax[f]);
             return -1;
         }
@@ -530,9 +540,9 @@ int main(int argc, char **argv){
         const char *lock_path = "/var/run/fanpilotd.lock";
         int lf = open(lock_path, O_CREAT | O_RDWR, 0644);
         if (lf < 0) {
-            fprintf(stderr, "⚠️ 打不开锁文件 %s: %s —— 无法保证单实例\n", lock_path, strerror(errno));
+            logmsg( "⚠️ 打不开锁文件 %s: %s —— 无法保证单实例\n", lock_path, strerror(errno));
         } else if (flock(lf, LOCK_EX | LOCK_NB) != 0) {
-            fprintf(stderr,
+            logmsg(
                 "✗ 已有另一个 fanpilotd 在运行（锁 %s 被占用）—— 拒绝启动。\n"
                 "  两个实例会抢写同一组 SMC 寄存器。先停掉旧的：\n"
                 "    sudo launchctl bootout system/com.newmac.fanpilotd\n", lock_path);
@@ -540,11 +550,11 @@ int main(int argc, char **argv){
         }
     }
 
-    if (smc_open() != 0) { fprintf(stderr, "✗ 打不开 SMC\n"); return 1; }
+    if (smc_open() != 0) { logmsg( "✗ 打不开 SMC\n"); return 1; }
     if (init_fan_keys(1) != 0) return 1;
-    if (enum_sensors() != 0) { fprintf(stderr, "✗ 找不到 Tp* 传感器\n"); return 1; }
+    if (enum_sensors() != 0) { logmsg( "✗ 找不到 Tp* 传感器\n"); return 1; }
 
-    fprintf(stderr, "fanpilotd 2 启动: %d 个传感器 · 风扇0 %.0f~%.0f · 风扇1 %.0f~%.0f\n",
+    logmsg( "fanpilotd 2 启动: %d 个传感器 · 风扇0 %.0f~%.0f · 风扇1 %.0f~%.0f\n",
             g_ntemp, g_fmin[0], g_fmax[0], g_fmin[1], g_fmax[1]);
     log_effective();
 
@@ -568,7 +578,7 @@ int main(int argc, char **argv){
             //    但这是「自己不断触发自己」那一类，宁可多一道闸门：退回 usleep 并留痕一次。
             if (CFRunLoopRunInMode(kCFRunLoopDefaultMode, wait, false) == kCFRunLoopRunFinished) {
                 static int warned = 0;
-                if (!warned++) fprintf(stderr, "⚠️ run loop 无事件源（立即返回）—— 退回 usleep，事件响应变为最坏 %.0fs\n", wait);
+                if (!warned++) logmsg( "⚠️ run loop 无事件源（立即返回）—— 退回 usleep，事件响应变为最坏 %.0fs\n", wait);
                 usleep((useconds_t)(wait * 1e6));
             }
         }
@@ -597,7 +607,7 @@ int main(int argc, char **argv){
     }
 
     // 正常退出 / SIGTERM：交还固件（SIGKILL 走不到这里，靠 launchd KeepAlive）
-    fprintf(stderr, "退出 → 交还固件自动控制\n");
+    logmsg( "退出 → 交还固件自动控制\n");
     fans_to_firmware();
     double z[NFAN] = {0, 0};
     write_status("stopped_firmware_auto", -1, -1, -1, z, z);

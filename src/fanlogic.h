@@ -22,7 +22,7 @@
 #define FL_DEFAULT_PCT          50.0  // 默认定速：各风扇硬件上限的 50%
 #define FL_CHECK_MIN             5.0  // 巡检间隔下限：别把守护写成 CPU 大户
 #define FL_CHECK_MAX            60.0  // 上限：过热响应最坏延迟一个间隔，60s 已是极限
-#define FL_CHECK_DEFAULT        10.0
+#define FL_CHECK_DEFAULT         5.0  // 2026-10-28 使用者：10s 太慢 ⇒ 5s（多的全是 SMC 读，写入仍为 0）
 #define FL_EMERG_MIN            70.0  // 不许低到天天误触发
 #define FL_EMERG_MAX            95.0  // ⭐ 不许把保护调没
 #define FL_EMERG_DEFAULT        90.0
