@@ -89,6 +89,14 @@ if [ -n "${CONSOLE_USER}" ] && [ "${CONSOLE_USER}" != "root" ]; then
   echo "  ✅ 配置目录+文件属主 → ${CONSOLE_USER}（菜单栏 App 可原子写；安全阈值仍由守护硬夹）"
 fi
 
+# 日志轮转：1 MB 轮一次、保留 3 份、gzip。
+# 🩸 2026-10-28：日志从不轮转，一天就涨到 46 KB（主要是测试）—— 「随时间无限增长」与写入风暴同属一类
+cat > /etc/newsyslog.d/com.newmac.fanpilotd.conf <<'NSL'
+# logfilename              mode count size(KB) when  flags
+/var/log/fanpilotd.log     644  3     1024     *     JN
+NSL
+echo "  ✅ 日志轮转 /etc/newsyslog.d/com.newmac.fanpilotd.conf（1 MB × 3）"
+
 echo "=== 3. 卸载旧实例（若有）——轮询等 label 真消失（坑6）==="
 if launchctl print "system/${LABEL}" >/dev/null 2>&1; then
   launchctl bootout "system/${LABEL}" 2>/dev/null || true

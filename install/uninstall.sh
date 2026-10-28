@@ -36,7 +36,7 @@ else
 fi
 
 echo "=== 3. 删除文件 ==="
-rm -f "${PLIST}" "${BIN}" "${STATUS}"
+rm -f "${PLIST}" "${BIN}" "${STATUS}" /etc/newsyslog.d/com.newmac.fanpilotd.conf
 echo "  ✅ 已删 ${PLIST}"
 echo "  ✅ 已删 ${BIN}"
 echo "  ⏭  保留配置 /usr/local/etc/fanpilot/fanpilot.conf 与日志 /var/log/fanpilotd.log"

@@ -67,6 +67,10 @@ ti="$(awk '/<key>ThrottleInterval<\/key>/{getline; gsub(/[^0-9]/,""); print}' "$
 [ "${ti:-0}" -ge 10 ] && ok "ThrottleInterval = ${ti}s ≥ 10（启动失败时不会每秒重扫 3669 个 SMC 键）" \
                       || bad "ThrottleInterval = ${ti:-缺失}" "启动持续失败时会形成重启风暴"
 
+[ -f /etc/newsyslog.d/com.newmac.fanpilotd.conf ] \
+  && [ "$(newsyslog -nvf /etc/newsyslog.d/com.newmac.fanpilotd.conf 2>&1 | grep -c 'fanpilotd.log')" != "0" ] \
+  && ok "守护日志有轮转（newsyslog 能解析该配置）" || bad "守护日志没有轮转" "日志会随时间无限增长"
+
 echo "═══ D. 状态文件与控制效果 ═══"
 if [ -f "${STATUS}" ]; then
   age=$(( $(date +%s) - $(awk -F'[:,]' '/"ts"/{gsub(/[^0-9]/,"",$2);print $2;exit}' "${STATUS}") ))
