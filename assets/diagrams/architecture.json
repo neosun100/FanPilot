@@ -1,0 +1,27 @@
+{"kind":"architecture","direction":"LR","theme":"light",
+"title":"FanPilot 2 · 架构","subtitle":"权限隔离：全机只有 root 守护能写 SMC；菜单栏 App 无任何特权",
+"footer":"写一次就不动 · 稳态写 SMC 0 次 · 每 10 s 只读巡检一次",
+"groups":[
+ {"id":"user","label":"用户域（无特权）","kind":"network"},
+ {"id":"root","label":"root LaunchDaemon","kind":"network"},
+ {"id":"hw","label":"硬件","kind":"network"}],
+"nodes":[
+ {"id":"me","label":"你","icon":"glyph:user"},
+ {"id":"app","label":"FanPilot.app","sub":"菜单栏 · 10 s 刷新","icon":"glyph:browser","group":"user"},
+ {"id":"conf","label":"fanpilot.conf","sub":"percent = 85","icon":"glyph:file","group":"user"},
+ {"id":"status","label":"status.json","sub":"0644 · 人人可读","icon":"glyph:doc","group":"root"},
+ {"id":"daemon","label":"fanpilotd","sub":"C · 5.8 MB · 0.017% CPU","icon":"glyph:service","group":"root","pulse":true},
+ {"id":"pm","label":"macOS 电源事件","sub":"睡眠 / 唤醒","icon":"glyph:event"},
+ {"id":"smc","label":"AppleSMC","sub":"F*md · F*Tg（锁存）","icon":"glyph:key","group":"hw"},
+ {"id":"fans","label":"两个风扇","sub":"上限 5349 / 5777","icon":"glyph:factory","group":"hw"},
+ {"id":"temp","label":"23 个核心温度","sub":"Tp*","icon":"glyph:monitor","group":"hw"}],
+"edges":[
+ {"from":"me","to":"app","flow":"request","label":"选百分比"},
+ {"from":"app","to":"conf","flow":"write","label":"原子写"},
+ {"from":"conf","to":"daemon","flow":"event","label":"即刻生效"},
+ {"from":"pm","to":"daemon","flow":"event","label":"交还 / 接管"},
+ {"from":"daemon","to":"smc","flow":"write","label":"仅在不一致时写"},
+ {"from":"smc","to":"fans","flow":"control"},
+ {"from":"temp","to":"daemon","flow":"read"},
+ {"from":"daemon","to":"status","flow":"data"},
+ {"from":"status","to":"app","flow":"read","label":"显示"}]}
