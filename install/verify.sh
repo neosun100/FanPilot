@@ -63,6 +63,10 @@ ka="$(grep -c -A1 '<key>KeepAlive</key>' "${PLIST}" 2>/dev/null || true)"
 kav="$(awk '/<key>KeepAlive<\/key>/{getline; print}' "${PLIST}" | grep -c 'true' || true)"
 [ "${kav}" != "0" ] && ok "KeepAlive = true" || bad "KeepAlive 不是 true" "失效安全被破坏"
 
+ti="$(awk '/<key>ThrottleInterval<\/key>/{getline; gsub(/[^0-9]/,""); print}' "${PLIST}")"
+[ "${ti:-0}" -ge 10 ] && ok "ThrottleInterval = ${ti}s ≥ 10（启动失败时不会每秒重扫 3669 个 SMC 键）" \
+                      || bad "ThrottleInterval = ${ti:-缺失}" "启动持续失败时会形成重启风暴"
+
 echo "═══ D. 状态文件与控制效果 ═══"
 if [ -f "${STATUS}" ]; then
   age=$(( $(date +%s) - $(awk -F'[:,]' '/"ts"/{gsub(/[^0-9]/,"",$2);print $2;exit}' "${STATUS}") ))

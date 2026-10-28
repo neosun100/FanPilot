@@ -14,7 +14,7 @@
 //   每 check_interval 秒巡检      ① 紧急：温度 ≥ 阈值 ⇒ 打满（5°C 回差）
 //                                ② 回读 md/Tg，被外部改动才重写
 //                                ③ 传感器读失败 ⇒ 交还固件
-//   SIGKILL / 崩溃               launchd KeepAlive ~1s 拉起新实例重新接管
+//   SIGKILL / 崩溃               风扇保持锁存的定速值；launchd KeepAlive 10s 后拉起新实例
 //
 // 稳态成本：每 10 秒 ~29 次 SMC **读**（23 温度 + 每风扇 md/Tg/实际转速），
 // SMC **写 0 次**，一次状态文件原子替换。没有任何其它定时器。
@@ -151,6 +151,7 @@ static Key    g_temp[MAX_SENSORS]; static int g_ntemp = 0;   // Tp* 簇
 static Key    g_md[NFAN], g_tg[NFAN], g_ac[NFAN];
 static double g_fmin[NFAN], g_fmax[NFAN];                    // 运行时读到的硬件上下限
 static long   g_writes = 0;
+static time_t g_last_write = 0;    // 最近一次 SMC 写入的墙钟时间（0 = 从未）—— 让「累计 N 次」可被验证
 static long   g_external = 0;      // 被外部改动并纠正的次数（> 0 说明有别的程序在抢）
 static int    g_emergency = 0;
 static int    g_failsafe = 0;
@@ -206,8 +207,11 @@ static int read_temps(double *hottest, double *average, double *coolest){
     *hottest = hot; *average = sum / got; *coolest = cool; return 0;
 }
 
+// 交还写入也计入 writes_total —— 菜单里的「启动以来共写 N 次」若漏掉睡眠/退出时的交还，数字就偏小
+// （不受令牌桶限制：这是安全方向的写入，且只在边沿发生）
 static void fans_to_firmware(void){
-    for (int f = 0; f < NFAN; f++) key_write_u8(&g_md[f], 0);
+    for (int f = 0; f < NFAN; f++)
+        if (key_write_u8(&g_md[f], 0) == 0) { g_writes++; g_last_write = time(NULL); }
 }
 
 // ───────────────────────── 状态文件 ─────────────────────────
@@ -220,11 +224,11 @@ static void write_status(const char *mode, double hot, double avg, double cool,
     fprintf(fp,
       "{\n  \"ts\": %ld,\n  \"mode\": \"%s\",\n"
       "  \"temp_hottest_c\": %.2f,\n  \"temp_average_c\": %.2f,\n  \"temp_coolest_c\": %.2f,\n"
-      "  \"sensors\": %d,\n  \"writes_total\": %ld,\n  \"external_overrides\": %ld,\n"
+      "  \"sensors\": %d,\n  \"writes_total\": %ld,\n  \"last_write_ts\": %ld,\n  \"external_overrides\": %ld,\n"
       "  \"config\": {\"percent\": %.1f, \"check_interval\": %.1f, \"emergency_temp\": %.0f,"
       " \"emergency_source\": \"%s\"},\n"
       "  \"fans\": [\n",
-      (long)time(NULL), mode, hot, avg, cool, g_ntemp, g_writes, g_external,
+      (long)time(NULL), mode, hot, avg, cool, g_ntemp, g_writes, (long)g_last_write, g_external,
       g_cfg.percent, g_cfg.check_interval, g_cfg.emergency_temp, fl_src_name(g_cfg.emergency_source));
     // set_rpm = 定速折算值（不含紧急）；target_rpm = 此刻实际下发的目标（紧急时为上限）
     for (int f = 0; f < NFAN; f++)
@@ -310,6 +314,7 @@ static void check_once(const char *why_in){
                 // 先 md=1 再写 Tg：顺序反了会有「已切手动但目标是旧值/0」的窗口
                 if (md != 1 && key_write_u8(&g_md[f], 1) == 0) g_writes++;
                 if (key_write_flt(&g_tg[f], target) == 0) g_writes++;
+                g_last_write = time(NULL);
             }
         }
         if (key_read_flt(&g_ac[f], &ac[f]) != 0) ac[f] = -1;
@@ -557,7 +562,16 @@ int main(int argc, char **argv){
         // 🩸 等待时长按「距上次巡检还剩多少」算，不是每次都等满一个间隔 ——
         //    否则频繁的目录噪音会不断重置等待，**饿死**巡检（紧急保护随之失效）。
         double wait = g_cfg.check_interval - (awake_now() - last);
-        if (wait > 0) CFRunLoopRunInMode(kCFRunLoopDefaultMode, wait, false);
+        if (wait > 0) {
+            // 🔴 空转保护：本模式没有任何事件源时 CFRunLoopRunInMode **立刻**返回 Finished，
+            //    主循环会变成 100% CPU 的忙等。实测目前不会发生（主队列算事件源），
+            //    但这是「自己不断触发自己」那一类，宁可多一道闸门：退回 usleep 并留痕一次。
+            if (CFRunLoopRunInMode(kCFRunLoopDefaultMode, wait, false) == kCFRunLoopRunFinished) {
+                static int warned = 0;
+                if (!warned++) fprintf(stderr, "⚠️ run loop 无事件源（立即返回）—— 退回 usleep，事件响应变为最坏 %.0fs\n", wait);
+                usleep((useconds_t)(wait * 1e6));
+            }
+        }
         if (g_stop) break;
         if (g_reload) {
             g_reload = 0;
