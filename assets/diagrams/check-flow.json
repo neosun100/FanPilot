@@ -1,5 +1,5 @@
 {"kind":"flowchart","direction":"TB","theme":"light",
-"title":"一次巡检做什么（每 10 s）","subtitle":"只读为主：回读与目标一致就什么都不写 ⇒ 稳态写 SMC 0 次",
+"title":"一次巡检做什么（每 5 s）","subtitle":"只读为主：回读与目标一致就什么都不写 ⇒ 稳态写 SMC 0 次",
 "footer":"写入另有两道硬上限：令牌桶（突发 40 · 120 次/小时）+ 被抢写 3 次让步 30 分钟",
 "nodes":[
  {"id":"tick","label":"巡检到期","icon":"glyph:clock"},
