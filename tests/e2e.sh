@@ -111,7 +111,7 @@ exp_target(){
   awk -v p="$2" -v mx="${mx}" -v mn="${mn}" 'BEGIN{t=int(mx*p/100+0.5); if(t<mn)t=mn; if(t>mx)t=mx; print t}'; }
 stat_fan_field(){ awk -v f="$1" -v k="\"$2\"" -F'[:,]' '/"id": /{id=$2+0; for(i=1;i<=NF;i++) if($i ~ k"$" || $i ~ " "k) {v=$(i+1)+0}; if(id==f){print v; exit}}' "${STATUS}"; }
 fan_md(){     "${FANCTL}" kv 2>/dev/null | sed -n "s/^fan$1_mode=//p"; }
-reload_count(){ grep -c '^生效配置' /var/log/fanpilotd.log 2>/dev/null || echo 0; }
+reload_count(){ grep -c '生效配置' /var/log/fanpilotd.log 2>/dev/null || echo 0; }   # 行首现在是时间戳
 
 DAEMON_UP=0
 pgrep -x fanpilotd >/dev/null 2>&1 && DAEMON_UP=1
@@ -338,8 +338,14 @@ fi
 
 grp "回归 R13 —— 🔴 稳态写 SMC 必须为 0（使用者头号约束：写入风暴曾导致死机）"
 if [ "${DAEMON_UP}" = "1" ]; then
-  w1="$(stat_num writes_total)"; ts1="$(stat_num ts)"; sleep 35
-  w2="$(stat_num writes_total)"; ts2="$(stat_num ts)"
+  # 🩸 2026-10-28：使用者在测试中途从菜单改了档（窗口内出现一次「生效配置 90%」重载）⇒ 2 次写入被误判为失败。
+  #    窗口内若发生配置重载 = 外部操作干扰，重测一次（最多 2 次），不把人的操作算成守护的错。
+  for attempt in 1 2; do
+    r1="$(reload_count)"; w1="$(stat_num writes_total)"; ts1="$(stat_num ts)"; sleep 35
+    w2="$(stat_num writes_total)"; ts2="$(stat_num ts)"; r2="$(reload_count)"
+    [ "${r2}" = "${r1}" ] && break
+    printf '  ↻ 窗口内发生 %s 次配置重载（外部操作），重测\n' "$(( r2 - r1 ))"
+  done
   d=$(( ${w2:-0} - ${w1:-0} ))
   [ "${d}" = "0" ] && ok "⭐稳态 35 秒（≥3 次巡检）写 SMC ${d} 次" \
                    || bad "稳态 35 秒写 SMC ${d} 次 —— 定速必须写一次就不再动"
@@ -446,6 +452,35 @@ cnt_c(){ sed -E 's|^[[:space:]]*//.*$||' "${ROOT}/src/fanpilotd.c" | grep -c "$1
 [ "$(cnt_c 'kCFRunLoopRunFinished')" != "0" ] \
   && ok "主循环处理 run loop 立即返回的情形（不会变成 100% CPU 忙等）" \
   || bad "主循环未处理 kCFRunLoopRunFinished —— 无事件源时会忙等"
+
+grp "回归 R19 —— App 盯 status.json：跟得上、且不会被别的文件唤醒（刷新风暴）"
+# 🩸 只盯这一个文件、不盯 /var/run 目录 —— 盯目录会被别的程序反复唤醒（与 R15 同一类）
+APPX=/Applications/FanPilot.app/Contents/MacOS/FanPilot
+if [ "${DAEMON_UP}" = "1" ] && pgrep -x FanPilot >/dev/null 2>&1; then
+  P="$(pgrep -x FanPilot | head -1)"
+  rpt(){ kill -USR1 "${P}"; sleep 0.5; sed -n "s/.*\"$1\": \([0-9.a-z]*\).*/\1/p" /tmp/fanpilot-ui.json; }
+  [ "$(rpt watching_status)" = "true" ] && ok "App 正在监听 status.json" || bad "App 没有监听 status.json"
+  c1="$(rpt refresh_count)"
+  # 往 /var/run 里狂造 50 次无关变化：盯的是单个文件，refresh 不得因此增加
+  for i in $(seq 50); do : > /var/run/.e2e-noise; rm -f /var/run/.e2e-noise; done
+  sleep 1; c2="$(rpt refresh_count)"
+  [ "$(( c2 - c1 ))" -le 1 ] && ok "⭐/var/run 里 100 次无关事件 → App 刷新 $(( c2 - c1 )) 次（只盯单个文件）" \
+                           || bad "/var/run 噪音触发了 $(( c2 - c1 )) 次刷新 —— 盯成了目录"
+  # 跟得上：守护写完 ≤ 1s 内 App 读到的就是最新 ts（连续 3 次巡检）
+  okn=0
+  for i in 1 2 3; do
+    sleep "$(stat_num check_interval | cut -d. -f1)"; sleep 0.5
+    # 🩸 先读守护 ts、再让 App 自报，判「App 看到的 ≥ 自报前已存在的」。
+    #    初版反过来（先自报、再读 ts）：守护恰好在那 0.5s 内又写一次就误判（2026-10-28 实测 2/3）。
+    before="$(stat_num ts)"
+    seen="$(rpt last_seen_status_ts | cut -d. -f1)"
+    [ "${seen:-0}" -ge "${before:-1}" ] && okn=$((okn+1))
+  done
+  [ "${okn}" = "3" ] && ok "⭐连续 3 次巡检，App 显示的都是守护最新一次写入（屏幕延迟 ≤ 巡检间隔）" \
+                     || bad "只有 ${okn}/3 次跟上守护的最新写入 —— 监听失效或没重挂"
+else
+  skip "守护或菜单栏 App 未运行，跳过 R19"
+fi
 
 grp "回归 R14 —— 测试脚本自己留下孤儿守护（2026-09-14 真事故）"
 # 事故：R4 裸启动一个 fanpilotd（真守护当时已停 ⇒ flock 无人占 ⇒ 它成了真守护并阻塞）；
