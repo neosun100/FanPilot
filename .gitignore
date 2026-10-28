@@ -18,3 +18,9 @@ src/fanctl
 src/fanpilotd
 state/
 tests/unit_logic
+research/power
+
+# 🔒 密钥一律不进仓库（全局安全规则）
+.env*
+*credentials*
+*secrets*
