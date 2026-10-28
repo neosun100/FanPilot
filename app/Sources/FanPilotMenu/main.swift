@@ -168,13 +168,47 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.menu = NSMenu()
         refresh()
+        // ⭐ 主刷新路径 = 盯 status.json：守护一写就刷新（2026-10-28 使用者认可，屏幕延迟 22s → ≤ 巡检间隔）
+        armStatusWatch()
+        // 慢速定时器只做两件事：① 判「守护卡住了」（文件不再变化时没有事件可等）② 文件监听丢了就重挂
         // 🩸 必须加到 .common 模式：默认的 .default 模式在菜单打开时（事件跟踪模式）
         //    **不会触发** ⇒ 菜单一打开里面的数字就冻住。
-        let t = Timer(timeInterval: 10.0, repeats: true) { [weak self] _ in self?.refresh() }
-        t.tolerance = 2.0       // 允许系统把唤醒和别的定时器合并（省电）
+        let t = Timer(timeInterval: 20.0, repeats: true) { [weak self] _ in
+            self?.refresh()
+            if self?.statusWatch == nil { self?.armStatusWatch() }
+        }
+        t.tolerance = 5.0       // 允许系统把唤醒和别的定时器合并（省电）
         RunLoop.main.add(t, forMode: .common)
         timer = t
         installSelfReport()
+    }
+
+    // ───── 盯 status.json ─────
+    // 🔴 只盯**这一个文件**，不盯 /var/run 目录：那个目录别的程序也在频繁写，盯目录会被它们反复唤醒
+    //    —— 与守护「23 秒 4074 次重载」是同一类问题。
+    // 守护用「临时文件 + rename」原子替换 ⇒ 旧 inode 被删，监听收到 .delete/.rename 后必须对新文件**重挂**。
+    private var statusWatch: DispatchSourceFileSystemObject?
+    private var refreshCount = 0          // 供 SIGUSR1 自报：e2e 用它判「没有刷新风暴」
+    private var redrawCount = 0           // 菜单栏图像真正重画的次数（每次都会触发外部辅助功能查询，见 setTitle）
+    private var lastSeenTs: Double = 0    // 最近一次刷新读到的状态 ts
+
+    private func armStatusWatch() {
+        statusWatch?.cancel()
+        statusWatch = nil
+        let fd = open(statusPath, O_EVTONLY)
+        guard fd >= 0 else { return }     // 守护没跑 / 文件还没生成：慢速定时器会再试
+        let src = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: fd, eventMask: [.write, .extend, .delete, .rename], queue: .main)
+        src.setEventHandler { [weak self, weak src] in
+            guard let self, let src else { return }
+            let ev = src.data
+            self.refresh()
+            // 原子替换后旧文件已不是 status.json ⇒ 换新文件重挂（否则只能收到第一次更新）
+            if ev.contains(.delete) || ev.contains(.rename) { self.armStatusWatch() }
+        }
+        src.setCancelHandler { close(fd) }
+        src.resume()
+        statusWatch = src
     }
 
     /// `kill -USR1 $(pgrep -x FanPilot)` ⇒ 把菜单栏图标的**真实**窗口坐标写到 /tmp/fanpilot-ui.json。
@@ -193,7 +227,9 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let inScreen = f.minX >= sf.minX && f.maxX <= sf.maxX
             let underNotch = f.maxX > notchL && f.minX < notchR
             let json = """
-            {"x": \(f.minX), "width": \(f.width), "screen_width": \(sf.width), \
+            {"refresh_count": \(self.refreshCount), "redraw_count": \(self.redrawCount), "last_seen_status_ts": \(self.lastSeenTs), \
+            "watching_status": \(self.statusWatch != nil ? "true" : "false"), \
+            "x": \(f.minX), "width": \(f.width), "screen_width": \(sf.width), \
             "notch_left": \(notchL), "notch_right": \(notchR), "occluded": \(w.occlusionState.contains(.visible) ? "false" : "true"), \
             "visible": \(inScreen && !underNotch && w.occlusionState.contains(.visible) ? "true" : "false")}
             """
@@ -306,12 +342,16 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let key = "\(top)|\(bottom)|\(vis)"
         guard key != lastTitle else { return }
         lastTitle = key
+        redrawCount += 1
+        // ⚠️ 2026-10-28 试过改固定长度（假设「variableLength 每次重算菜单栏布局」）：实测无改善 ⇒ 已撤回。
+        //    重画的主要开销（≈7 ms/次）在 AppKit / 辅助功能一侧，我们的 twoLineImage 只占 0.4 ms（--bench）。
         b.image = twoLineImage(top, bottom, vis)
         b.imagePosition = .imageOnly
         b.title = ""
     }
 
     private func refresh() {
+        refreshCount += 1
         guard let s = readStatus() else {
             setTitle("--°C", "停", .stale)
             updateMenu(nil)
@@ -319,11 +359,15 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         // 两风扇实际转速的平均。注意两风扇目标不同（各自按百分比），
         // 所以平均**不能**当故障指示 —— 故障在菜单里逐风扇判（见 updateMenu）。
+        lastSeenTs = s.ts
         let avgRPM = s.fans.map(\.actual_rpm).reduce(0, +) / Double(max(s.fans.count, 1))
         // 菜单栏温度 = **最高核心**（使用者 2026-10-28 指定：最关注整颗 CPU 最热的那一处）。
         // 紧急判据用哪个口径另由配置 emergency_source 决定，菜单里标在对应那一行旁边。
-        let temp = String(format: "%.0f°C", s.temp_hottest_c)   // 使用者 2026-10-28：空间够，单位写全
-        let rpm  = String(format: "%.0f", avgRPM)
+        let temp = String(format: "%.0f°C", sticky(s.temp_hottest_c, &shownTemp, band: 1.0, step: 1))
+        // 取整到 10 RPM：实际转速每次采样都抖 ±10（4540 / 4556 …），不取整的话「内容不变不重绘」
+        // 几乎从不生效，5s 巡检下菜单栏每 5 秒重画一次（2026-10-28 实测 App CPU 0.026% → 0.17%）。
+        // 下拉菜单里仍显示每个风扇的精确实际转速。
+        let rpm  = String(format: "%.0f", sticky(avgRPM, &shownRPM, band: 20, step: 10))
         if !s.isFresh {
             setTitle(temp, "陈旧", .stale)        // 陈旧就说出来，绝不静默展示旧值
         } else if s.mode.hasPrefix("failsafe") || s.mode.hasPrefix("stopped") {
@@ -335,8 +379,27 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             setTitle(temp, rpm, .normal)
         }
-        updateMenu(s)
+        // 菜单关着时不重算二十几行菜单文字（看不见）—— 打开时 menuWillOpen 会立即刷新
+        if menuOpen || !menuBuilt { updateMenu(s) }
     }
+
+    // ── 菜单栏显示值的回差 ──
+    // 🩸 2026-10-28 单变量对照：巡检 5s 时 App CPU 1.47 ms/s，调到 60s 降到 0.22 ⇒ 开销来自刷新本身，
+    //    折合每次约 7 ms；120s 内刷新 30 次重画 23 次 —— 每次重画都会让系统通知辅助功能客户端、
+    //    它们回头查询我们的图标（sample 里那串 AX 调用栈就在我们进程里）。
+    //    重画的主因是取整边界抖动（89.4 ↔ 89.6 显示成 89 ↔ 90）⇒ 离当前显示值差满 band 才更新。
+    //    代价：菜单栏温度与真实值偏差 < 1°C；下拉菜单里仍是精确值。
+    private var shownTemp: Double?
+    private var shownRPM: Double?
+    private func sticky(_ raw: Double, _ shown: inout Double?, band: Double, step: Double) -> Double {
+        if let v = shown, abs(raw - v) < band { return v }
+        let v = (raw / step).rounded() * step
+        shown = v
+        return v
+    }
+
+    private var menuOpen = false
+    func menuDidClose(_ menu: NSMenu) { if menu === builtMenu { menuOpen = false } }
 
     /// 实际转速不到目标一半 = 疑似故障（卡住 / 断线）。
     /// 定速模式下目标只在启动/改档时变化，爬升 0→满速实测 6~9s < 一个刷新周期，误报窗口很小。
@@ -541,6 +604,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 打开菜单时：立刻刷一次（不展示上一个 tick 的旧值），并做那些要 fork 子进程的查询
     func menuWillOpen(_ menu: NSMenu) {
         guard menu === builtMenu else { return }   // 子菜单打开也会回调，只处理根菜单
+        menuOpen = true
         refresh()
         refreshLoginItem()
     }
@@ -643,6 +707,21 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func quit() { NSApp.terminate(nil) }
+}
+
+// --bench：刷新路径各环节的单次耗时（2026-10-28 定位「每次刷新约 7 ms」用）
+if CommandLine.arguments.contains("--bench") {
+    let c = Controller()
+    func t(_ name: String, _ n: Int = 200, _ f: () -> Void) {
+        let t0 = DispatchTime.now().uptimeNanoseconds
+        for _ in 0..<n { f() }
+        let ms = Double(DispatchTime.now().uptimeNanoseconds - t0) / 1e6 / Double(n)
+        print(String(format: "%-28@ %.3f ms/次", name as NSString, ms))
+    }
+    t("readStatus（读文件+解 JSON）") { _ = readStatus() }
+    var i = 0
+    t("twoLineImage（画菜单栏图）") { i += 1; _ = c.previewImage("\(80 + i % 15)°C", "\(4500 + i % 50)") }
+    exit(0)
 }
 
 // --dump-menu：打印整份菜单 + 断言槽位契约。退出码非 0 = 菜单结构坏了。
