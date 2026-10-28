@@ -41,6 +41,7 @@ struct Status: Decodable {
     let temp_coolest_c: Double
     let sensors: Int
     let writes_total: Int
+    let last_write_ts: Double?      // 旧版状态文件没有
     let external_overrides: Int
     let config: ConfigInfo
     let fans: [FanInfo]
@@ -145,6 +146,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 两风扇上限不同（5349 / 5777），同一百分比各自折算 ⇒ 两风扇「一样卖力」。
     /// 「自定义…」可输入任意 0~100：任何值最终都被守护夹在硬件 [F*Mn, F*Mx] 内，
     /// 且过热打满不受此设置影响 ⇒ 输入框不会把机器置于危险状态。
+    /// 菜单栏温度（下行）字号；上行转速固定 8pt。改它要重跑 e2e R7（宽度 / 标记条空隙 / 顶部不出界）。
+    static let tempPt: CGFloat = 12
     static let presets: [(pct: Int, hint: String)] = [
         (30, "最静"), (40, "安静"), (50, "均衡"), (60, "偏凉"),
         (70, "凉 · 有风声"), (80, "很凉 · 风声明显"), (90, "接近全速"), (100, "全速"),
@@ -152,6 +155,15 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var customItem: NSMenuItem?
 
     func applicationDidFinishLaunching(_: Notification) {
+        // 🔴 单实例：「开机自动启动」会 launchctl bootstrap 一个 RunAtLoad 的 agent，
+        //    它会**再拉起一个本 App** ⇒ 菜单栏两个图标、资源翻倍。后来者直接退出。
+        let me = ProcessInfo.processInfo.processIdentifier
+        if let id = Bundle.main.bundleIdentifier,
+           NSRunningApplication.runningApplications(withBundleIdentifier: id)
+               .contains(where: { $0.processIdentifier != me }) {
+            FileHandle.standardError.write("已有 FanPilot 在运行 —— 本实例退出\n".data(using: .utf8)!)
+            exit(0)
+        }
         NSApp.setActivationPolicy(.accessory)   // 只在菜单栏出现，不进 Dock、不抢焦点
         item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.menu = NSMenu()
@@ -162,6 +174,33 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         t.tolerance = 2.0       // 允许系统把唤醒和别的定时器合并（省电）
         RunLoop.main.add(t, forMode: .common)
         timer = t
+        installSelfReport()
+    }
+
+    /// `kill -USR1 $(pgrep -x FanPilot)` ⇒ 把菜单栏图标的**真实**窗口坐标写到 /tmp/fanpilot-ui.json。
+    /// 🩸 2026-10-28：使用者看不到图标，而 macOS 26 的菜单栏项都由「控制中心」托管，
+    ///    外部进程分不出哪个是我们 —— 只有 App 自己知道自己在哪（macos-menubar-app 铁律 12：App 自报）。
+    ///    判据：x 落在屏幕内且不在刘海区 ⇒ 可见；否则被挤进了溢出区。
+    private var usr1: DispatchSourceSignal?
+    private func installSelfReport() {
+        signal(SIGUSR1, SIG_IGN)
+        let src = DispatchSource.makeSignalSource(signal: SIGUSR1, queue: .main)
+        src.setEventHandler { [weak self] in
+            guard let self, let w = self.item.button?.window, let scr = w.screen ?? NSScreen.main else { return }
+            let f = w.frame, sf = scr.frame
+            let notchL = scr.auxiliaryTopLeftArea?.maxX ?? sf.midX
+            let notchR = scr.auxiliaryTopRightArea?.minX ?? sf.midX
+            let inScreen = f.minX >= sf.minX && f.maxX <= sf.maxX
+            let underNotch = f.maxX > notchL && f.minX < notchR
+            let json = """
+            {"x": \(f.minX), "width": \(f.width), "screen_width": \(sf.width), \
+            "notch_left": \(notchL), "notch_right": \(notchR), "occluded": \(w.occlusionState.contains(.visible) ? "false" : "true"), \
+            "visible": \(inScreen && !underNotch && w.occlusionState.contains(.visible) ? "true" : "false")}
+            """
+            try? json.write(toFile: "/tmp/fanpilot-ui.json", atomically: true, encoding: .utf8)
+        }
+        src.resume()
+        usr1 = src
     }
 
     /// 菜单栏两行显示：上行温度、下行转速（自己渲染成模板图，见下方 🩸）
@@ -178,37 +217,44 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 菜单栏的显示状态。用枚举而不是散落的 bool —— 避免出现「既紧急又陈旧」这类
     /// 自相矛盾的组合，也让每个状态的视觉表达只在一处定义。
     enum Vis { case normal, emergency, fault, firmware, stale }
-    private func twoLineImage(_ top: String, _ bottom: String, _ vis: Vis) -> NSImage {
+    /// 参数是语义名（温度、转速），**不是位置名** —— 上下排列只在这一个函数里决定。
+    private func twoLineImage(_ temp: String, _ rpm: String, _ vis: Vis) -> NSImage {
         let h = NSStatusBar.system.thickness          // 实测本机 22pt
-        // ⭐ 字号由「两行必须装进 h」反推：9pt 行高约 11pt ⇒ 两行 23pt > 22pt 装不下，
-        //    溢出只能往上顶 —— 那才是早先「靠上对齐」的真因。
-        let fontSize: CGFloat = 8
-        let font = NSFont.monospacedDigitSystemFont(ofSize: fontSize, weight: .medium)
+        // 2026-10-28 使用者：「上面是转速，下面是温度；温度字体大一些」
+        // ⭐ 按**基线**排版而不是按行高堆叠：数字和 °C 都没有下伸部，按行高（ascender−descender）
+        //    堆两行会把下伸空间白白算两次 —— 那正是 1.x 两行都只能用 8pt 的原因
+        //    （1.x 注释：「9pt 行高约 11pt ⇒ 两行 23pt > 22pt 装不下」——那是按行高算的）。
+        let tempFont = NSFont.monospacedDigitSystemFont(ofSize: Self.tempPt, weight: .semibold)
+        let rpmFont  = NSFont.monospacedDigitSystemFont(ofSize: 8, weight: .medium)
         let ink = NSColor.black
-        let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: ink]
-        let sTop = NSAttributedString(string: top, attributes: attrs)
-        let sBot = NSAttributedString(string: bottom, attributes: attrs)
+        let sTemp = NSAttributedString(string: temp, attributes: [.font: tempFont, .foregroundColor: ink])
+        // 使用者 2026-10-28：转速后加小号单位「rpm」。只给纯数字加 —— 「固件 / 陈旧 / 停」不是转速
+        let unitFont = NSFont.systemFont(ofSize: 6, weight: .medium)
+        func rpmText(_ v: String) -> NSAttributedString {
+            let m = NSMutableAttributedString(string: v, attributes: [.font: rpmFont, .foregroundColor: ink])
+            if !v.isEmpty && v.allSatisfy(\.isNumber) {
+                m.append(NSAttributedString(string: " rpm", attributes: [.font: unitFont, .foregroundColor: ink]))
+            }
+            return m
+        }
+        let sRPM = rpmText(rpm)
 
-        // 🩸 固定宽度（消除横跳），但宽度要**尽量窄** —— 菜单栏是稀缺空间，
-        //    我们多占一点，别人就少一点。两处收窄：
-        //    ① 参照串用 "100°" 而不是 "100°C"：省掉一个字符宽，仍明确是温度
-        //    ② **不预留独立标记列**：文字右对齐，短内容天然在左侧留出空隙，
-        //       状态标记就画在那段空隙里 ⇒ 标记不额外占宽度
-        //    实测：34pt → 见 --render-preview 输出（约 -8pt）
-        let refTemp = NSAttributedString(string: "100°", attributes: attrs)
-        let refRPM  = NSAttributedString(string: "5777", attributes: attrs)
+        // 🩸 固定宽度（消除横跳），参照串取两行各自最宽的内容；不预留独立标记列。
+        let refTemp = NSAttributedString(string: "100°C", attributes: [.font: tempFont])
+        let refRPM  = rpmText("5777")
         let w = ceil(max(refTemp.size().width, refRPM.size().width)) + 1
 
-        let glyphH = ceil(font.ascender - font.descender)
-        let gap: CGFloat = 0
-        let pad = max(2, (h - glyphH * 2 - gap) / 2 + 1)   // +1 给贴底标记条让位
-        let wTop = ceil(sTop.size().width), wBot = ceil(sBot.size().width)
+        // 自下而上：贴底标记条占 0~2 ⇒ 温度基线 3.2（留 ≥1pt 空隙）；温度墨迹顶与转速之间留 1.5pt；
+        // 顶部**不留白**（使用者 2026-10-28：「顶部不要留白，温度字体可以再大」）—— 字号由 tempPt 反推装满
+        let baseTemp: CGFloat = 3.2
+        let baseRPM = baseTemp + tempFont.capHeight + 1.5
+        let wTemp = ceil(sTemp.size().width), wRPM = ceil(sRPM.size().width)
 
         let img = NSImage(size: NSSize(width: w, height: h))
         img.lockFocus()
-        // 右对齐（等宽数字 + 右对齐 = 视觉最稳）
-        sBot.draw(at: NSPoint(x: w - wBot - 1, y: pad))
-        sTop.draw(at: NSPoint(x: w - wTop - 1, y: pad + glyphH + gap))
+        // 右对齐（等宽数字 + 右对齐 = 视觉最稳）；draw(at:) 的 y 是行框底边 = 基线 + descender
+        sTemp.draw(at: NSPoint(x: w - wTemp - 1, y: baseTemp + tempFont.descender))
+        sRPM.draw(at:  NSPoint(x: w - wRPM - 1,  y: baseRPM + rpmFont.descender))
 
         // 🩸 状态标记的两条约束，都是实测踩出来的：
         //   ① **不能用 emoji**：isTemplate=true 时 AppKit 丢掉颜色、只用 alpha 当遮罩
@@ -267,7 +313,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func refresh() {
         guard let s = readStatus() else {
-            setTitle("--°", "停", .stale)
+            setTitle("--°C", "停", .stale)
             updateMenu(nil)
             return
         }
@@ -276,7 +322,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let avgRPM = s.fans.map(\.actual_rpm).reduce(0, +) / Double(max(s.fans.count, 1))
         // 菜单栏温度 = **最高核心**（使用者 2026-10-28 指定：最关注整颗 CPU 最热的那一处）。
         // 紧急判据用哪个口径另由配置 emergency_source 决定，菜单里标在对应那一行旁边。
-        let temp = String(format: "%.0f°", s.temp_hottest_c)
+        let temp = String(format: "%.0f°C", s.temp_hottest_c)   // 使用者 2026-10-28：空间够，单位写全
         let rpm  = String(format: "%.0f", avgRPM)
         if !s.isFresh {
             setTitle(temp, "陈旧", .stale)        // 陈旧就说出来，绝不静默展示旧值
@@ -324,7 +370,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
             dynItem(1)         // 实际 … RPM
         }
         m.addItem(.separator())
-        dynItem()              // SMC 写入 / 外部改动
+        dynItem()              // 巡检（只读）
+        dynItem()              // SMC 写入：启动以来共 N 次 · 最近一次 …
         m.addItem(.separator())
 
         // ⭐ 唯一需要用户调的东西：定速档。入口右侧显示当前值（不用点开就知道）。
@@ -400,7 +447,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
             lastSlotWrites = dyn.count
             return
         }
-        let need = 6 + s.fans.count * 2
+        let need = 7 + s.fans.count * 2
         if !menuBuilt || dyn.count != need { buildMenuSkeleton(fanCount: s.fans.count) }
         guard dyn.count == need else { return }
 
@@ -439,11 +486,11 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
             set(String(format: "实际 %.0f RPM  ·  硬件范围 %.0f ~ %.0f%@",
                        f.actual_rpm, f.min, f.max, fanLooksFaulty(f) ? "   ⚠️ 疑似故障" : ""))
         }
-        set(String(format: "每 %.0fs 巡检一次  ·  累计写 SMC %d 次%@",
-                   s.config.check_interval, s.writes_total,
-                   s.external_overrides > 0
-                     ? String(format: "  ·  ⚠️ 被外部改动 %d 次（有别的风扇软件？）", s.external_overrides)
-                     : ""))
+        // 🩸 1.x/2.0 初版写成一行「每 10s 巡检一次 · 累计写 SMC 4 次」，使用者读成「每 10 秒写 4 次」
+        //    （2026-10-28 实报）。⇒ 拆成两行：巡检明说「只读」，写入明说「启动以来」并给出最近一次的时间，可直接核验。
+        set(String(format: "巡检：每 %.0f 秒只读一次（一致就不写）", s.config.check_interval))
+        set("写 SMC：启动以来共 \(s.writes_total) 次  ·  最近一次 \(agoText(s.last_write_ts))"
+            + (s.external_overrides > 0 ? "  ·  ⚠️ 被外部改动 \(s.external_overrides) 次" : ""))
 
         let dOn = FileManager.default.fileExists(atPath: daemonPlist)
         set(dOn ? "风扇守护：开机自启 ✓（系统级，始终开启）"
@@ -496,6 +543,16 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard menu === builtMenu else { return }   // 子菜单打开也会回调，只处理根菜单
         refresh()
         refreshLoginItem()
+    }
+
+    /// 「23 分钟前」这类相对时间（最近一次写入）
+    private func agoText(_ ts: Double?) -> String {
+        guard let ts, ts > 0 else { return "从未" }
+        let d = max(0, Int(Date().timeIntervalSince1970 - ts))
+        if d < 60 { return "\(d) 秒前" }
+        if d < 3600 { return "\(d / 60) 分钟前" }
+        if d < 86400 { return "\(d / 3600) 小时前" }
+        return "\(d / 86400) 天前"
     }
 
     private func pctText(_ p: Double) -> String {
