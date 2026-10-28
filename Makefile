@@ -18,11 +18,12 @@ tools:  $(SRC)/fanctl
 $(SRC)/fanpilotd: $(SRC)/fanpilotd.c $(SRC)/fanlogic.h
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
 
-$(SRC)/fanctl: $(SRC)/fanctl.c
+# fanctl 也 #include fanlogic.h（共用「什么算核心温度」）⇒ 头文件必须列为依赖（见上面守护那条 🩸）
+$(SRC)/fanctl: $(SRC)/fanctl.c $(SRC)/fanlogic.h
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
 
 # 只读调研工具（不写任何 SMC 键）
-research: $(RESEARCH)/smcprobe $(RESEARCH)/sensors $(RESEARCH)/sample $(RESEARCH)/bench
+research: $(RESEARCH)/smcprobe $(RESEARCH)/sensors $(RESEARCH)/sample $(RESEARCH)/bench $(RESEARCH)/power
 $(RESEARCH)/%: $(RESEARCH)/%.c
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<
 
@@ -83,4 +84,4 @@ status:
 clean:
 	rm -f tests/unit_logic $(SRC)/fanpilotd $(SRC)/fanctl \
 	      $(RESEARCH)/smcprobe $(RESEARCH)/sensors $(RESEARCH)/sample \
-	      $(RESEARCH)/bench $(RESEARCH)/tf
+	      $(RESEARCH)/bench $(RESEARCH)/tf $(RESEARCH)/power

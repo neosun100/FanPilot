@@ -193,12 +193,12 @@ static int enum_sensors(void){
         in.data8 = CMD_READ_INDEX; in.data32 = i;
         if (smc_call(&in, &out) != KERN_SUCCESS || out.result != 0) continue;
         char n[5]; k2s(out.key, n);
-        if (n[0] != 'T' || n[1] != 'p') continue;
+        if (n[0] != 'T' || n[1] != 'p') continue;      // 便宜的预筛，免得对 3669 个键都问 keyinfo
         Key k; if (key_init(&k, n) != 0) continue;
         char t[5]; k2s(k.type, t);
-        if (strcmp(t, "flt ") || k.size != 4) continue;
-        double v; if (key_read_flt(&k, &v) != 0) continue;
-        if (v < -5 || v > 150) continue;
+        double v = -1e9;
+        if (k.size == 4) key_read_flt(&k, &v);
+        if (!fl_is_core_temp_key(n, t, k.size, v)) continue;   // 判据只在 fanlogic.h（与 fanctl 共用）
         g_temp[g_ntemp++] = k;
     }
     return g_ntemp > 0 ? 0 : -1;

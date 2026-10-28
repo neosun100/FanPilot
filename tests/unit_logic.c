@@ -190,6 +190,16 @@ static void test_storm_guards(void){
     ok(writes <= 2 * 3 * (86400 / 1800 + 1), "被持续抢写 1 天：纠正写入 ≤ ~294 次，且不拉锯");
 }
 
+static void test_core_temp_key(void){
+    group("fl_is_core_temp_key —— 什么算核心温度（守护与 fanctl 共用）");
+    ok(fl_is_core_temp_key("Tp00", "flt ", 4, 65.0), "Tp00 flt 4B 65°C → 是");
+    ok(!fl_is_core_temp_key("TVDP", "flt ", 4, 100.5), "[回归] TVDP 不是核心（fanctl 曾把它算进「最热」）");
+    ok(!fl_is_core_temp_key("TCMb", "flt ", 4, 96.8), "[回归] TCMb 不是核心");
+    ok(!fl_is_core_temp_key("Tp01", "ui16", 2, 65.0), "类型不是 flt → 否");
+    ok(!fl_is_core_temp_key("Tp02", "flt ", 4, 150.0), "读数 150°C（溢出/未接线）→ 否");
+    ok(!fl_is_core_temp_key("Tp03", "flt ", 4, -5.0), "读数 -5°C → 否");
+}
+
 static void test_darkwake(void){
     group("🔴 合盖：DarkWake 不接管，完全唤醒才接管");
     ok(fl_should_take_over(15) == 1, "完全唤醒（CPU|显示|音频|网络 = 15）→ 接管");
@@ -208,6 +218,7 @@ int main(void){
     test_rewrite();
     test_storm_guards();
     test_darkwake();
+    test_core_temp_key();
     printf("\n═══════════════════════════════\n  通过 %d · 失败 %d\n", g_pass, g_fail);
     if (g_fail == 0) printf("  ✅ 全部通过\n");
     return g_fail == 0 ? 0 : 1;

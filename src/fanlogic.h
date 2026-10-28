@@ -161,6 +161,14 @@ static inline int fl_needs_rewrite(int md_now, double tg_now, double target){
     return d > FL_REWRITE_TOLERANCE;
 }
 
+// ── 哪些 SMC 键算「核心温度」（守护与 fanctl 共用，单一来源）──────────────
+// 🩸 2026-10-28：fanctl 原来手写 5 个键，里面混着 TCMb / TVDP 两个**非核心**键（实测 TVDP 100.48 °C，
+//    比所有核心都热）⇒ fanctl 的「最热」和守护的「最热核心」不是一回事。
+// 规则：名字以 Tp 开头 · 类型 "flt " · 4 字节 · 读数在 (-5, 150) 内（排除未接线 / 溢出值）
+static inline int fl_is_core_temp_key(const char *name, const char *type4, unsigned size, double v){
+    return name[0] == 'T' && name[1] == 'p' && !strcmp(type4, "flt ") && size == 4 && v > -5 && v < 150;
+}
+
 // ── 睡眠期间要不要接管：只看「系统能力」这个事实 ─────────────────────
 // 🩸 2026-10-28：本机睡眠时约每小时一次 DarkWake（rtc/Maintenance，用电池，5~9 s），Power Nap 关着也有。
 //    旧逻辑收到「已唤醒」就接管 ⇒ 合盖放包里每小时把风扇冲向定速一次；

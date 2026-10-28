@@ -22,11 +22,13 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <IOKit/IOKitLib.h>
+#include "fanlogic.h"   // 只用 fl_is_core_temp_key：「什么算核心温度」与守护同一份定义
 
 #define KIDX 2
 #define CMD_READ_BYTES   5
 #define CMD_WRITE_BYTES  6
 #define CMD_READ_KEYINFO 9
+#define CMD_READ_INDEX   8
 
 typedef struct { uint8_t a,b,c,d; uint16_t r; } SVer;
 typedef struct { uint16_t v,l; uint32_t a,b,c; } SPLim;
@@ -137,6 +139,29 @@ static int fan_bounds(int fan, double *mn, double *mx){
     return (a && b) ? 0 : -1;
 }
 
+// 最热核心温度：按守护同一规则枚举全部 Tp*（fl_is_core_temp_key）。返回参与的传感器数。
+static int hottest_core(double *hot){
+    SData in, out; memset(&in, 0, sizeof in);
+    in.key = s2k("#KEY"); in.data8 = CMD_READ_KEYINFO;
+    SInfo ki; uint8_t b[32];
+    if (smc_info("#KEY", &ki) != 0 || smc_read("#KEY", &ki, b) != 0) return 0;
+    uint32_t total = ((uint32_t)b[0]<<24)|((uint32_t)b[1]<<16)|((uint32_t)b[2]<<8)|b[3];
+    int n = 0; *hot = -999;
+    for (uint32_t i = 0; i < total; i++) {
+        memset(&in, 0, sizeof in); in.data8 = CMD_READ_INDEX; in.data32 = i;
+        if (smc_call(&in, &out) != KERN_SUCCESS || out.result != 0) continue;
+        char name[5] = { (char)(out.key>>24), (char)(out.key>>16), (char)(out.key>>8), (char)out.key, 0 };
+        if (name[0] != 'T' || name[1] != 'p') continue;
+        SInfo si; if (smc_info(name, &si) != 0) continue;
+        char t[5] = { (char)(si.type>>24), (char)(si.type>>16), (char)(si.type>>8), (char)si.type, 0 };
+        double v = -1e9;
+        if (si.size == 4 && smc_read(name, &si, b) == 0) { float f; memcpy(&f, b, 4); v = f; }
+        if (!fl_is_core_temp_key(name, t, si.size, v)) continue;
+        n++; if (v > *hot) *hot = v;
+    }
+    return n;
+}
+
 static void print_status(void){
     int ok; int n = read_u8("FNum", &ok);
     printf("风扇数 FNum = %d\n\n", ok ? n : -1);
@@ -151,13 +176,14 @@ static void print_status(void){
                f, ac, tg, md, md == 0 ? "固件自动" : "手动", mn, mx);
     }
     printf("\n关键温度:\n");
+    // 几个参考键照常列出给人看（TCMb / TVDP 不是核心温度，只作参考）；「最热核心」按守护同一规则算
     const char *tk[] = {"Tp00","Tp0C","Tp0X","TCMb","TVDP",NULL};
-    double hot = -999;
     for (int i = 0; tk[i]; i++) {
         int o; double v = read_flt(tk[i], &o);
-        if (o) { printf("  %-5s %6.2f °C\n", tk[i], v); if (v > hot) hot = v; }
+        if (o) printf("  %-5s %6.2f °C\n", tk[i], v);
     }
-    printf("  ⇒ 最热 %.2f °C\n", hot);
+    double hot; int ns = hottest_core(&hot);
+    printf("  ⇒ 最热核心 %.2f °C（%d 个 Tp* 传感器，与守护同口径）\n", hot, ns);
 }
 
 // 机器可读输出（纯 ASCII，key=value）。
@@ -181,10 +207,8 @@ static void print_kv(void){
         printf("fan%d_min=%.0f\n",    f, mn);
         printf("fan%d_max=%.0f\n",    f, mx);
     }
-    const char *tk[] = {"Tp00","Tp0C","Tp0X","TCMb","TVDP",NULL};
-    double hot = -999;
-    for (int i = 0; tk[i]; i++) { int o; double v = read_flt(tk[i], &o); if (o && v > hot) hot = v; }
-    printf("temp_hottest=%.2f\n", hot);
+    double hot; int ns = hottest_core(&hot);
+    printf("temp_hottest=%.2f\ntemp_sensors=%d\n", hot, ns);   // 与守护的 temp_hottest_c 同口径
 }
 
 static int cmd_archive(const char *path){
