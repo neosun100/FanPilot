@@ -215,7 +215,7 @@ grp "回归 R7 —— 菜单栏宽度横跳 / emoji 变黑块 / 靠上对齐"
 if [ -x "${APPBIN}" ]; then
   ws=""
   for st in normal emergency fault firmware; do
-    out="$("${APPBIN}" --render-preview "/tmp/e2e-${st}.png" "57°" "2384" "${st}" 2>/dev/null)"
+    out="$("${APPBIN}" --render-preview "/tmp/e2e-${st}.png" "57°C" "2384" "${st}" 2>/dev/null)"
     w="$(printf '%s' "${out}" | sed -n 's/.*图像=(\([0-9.]*\),.*/\1/p')"
     ws="${ws} ${w}"
   done
@@ -224,12 +224,14 @@ if [ -x "${APPBIN}" ]; then
                        || bad "宽度不一致（${ws} ）—— 菜单栏会横跳"
   # 宽度不得回退到过去的臃肿值（34/38pt）
   w1="$(printf '%s\n' ${ws} | head -1)"
-  awk -v w="${w1}" 'BEGIN{exit !(w<=26)}' && ok "宽度 ${w1}pt ≤ 26pt（未回退到 34/38pt 的臃肿版）" \
+  # 上限 26 → 46：2026-10-28 使用者三次调整 —— 温度写全「°C」、转速在上温度在下、温度放大到 13pt
+  #   （「上下左右空间还比较宽裕」）。46 = 现值 42 + 余量，防止无意中继续变宽
+  awk -v w="${w1}" 'BEGIN{exit !(w<=46)}' && ok "宽度 ${w1}pt ≤ 46pt（使用者认可的 13pt 温度版）" \
                                           || bad "宽度 ${w1}pt 过宽，挤占菜单栏"
   # 🩸 状态标记不得与数字重叠（实测踩过：4 位转速占满全宽时，
   #    画在左侧空隙的标记直接压在数字上，数字读不出来）。
   #    判据：用**最宽内容**渲染紧急态，检查文字墨迹与贴底标记条之间必须有空行。
-  "${APPBIN}" --render-preview /tmp/e2e-collide.png "100°" "5777" emergency >/dev/null 2>&1
+  "${APPBIN}" --render-preview /tmp/e2e-collide.png "100°C" "5777" emergency >/dev/null 2>&1
   if [ -f /tmp/e2e-collide.png ] && command -v uv >/dev/null 2>&1; then
     gap="$(uv run --with pillow --no-project python -c "
 from PIL import Image
@@ -421,6 +423,29 @@ awk -v v="${iv:-0}" 'BEGIN{exit !(v>=10)}' && ok "App 刷新间隔 ${iv}s ≥ 10
   && ok "菜单栏内容不变时不重绘" || bad "每次刷新都重绘菜单栏图像"
 [ "$(nocomment_swift "${SW}" | grep -c 'a.window.level = .floating')" != "0" ] \
   && ok "弹窗先置顶再 runModal（不会藏到窗口后面让菜单「卡死」）" || bad "裸 runModal"
+
+grp "回归 R18 —— 会自己不断重来的那一类（重启风暴 / 重复实例）"
+# 🩸 与 R15（23s 4074 次重载）同一类：机制本身没坏，但在某种条件下会无限重复自己
+PL=/Library/LaunchDaemons/com.newmac.fanpilotd.plist
+ti="$(awk '/<key>ThrottleInterval<\/key>/{getline; gsub(/[^0-9]/,""); print}' "${PL}" 2>/dev/null)"
+[ "${ti:-0}" -ge 10 ] && ok "已装 plist 的 ThrottleInterval = ${ti}s（启动持续失败时不会每秒重扫 3669 个 SMC 键）" \
+                      || bad "ThrottleInterval = ${ti:-缺失} —— 启动失败时会形成重启风暴（1.x 是 1s）"
+APPX=/Applications/FanPilot.app/Contents/MacOS/FanPilot
+if [ -x "${APPX}" ] && pgrep -x FanPilot >/dev/null 2>&1 && [ "${CONSOLE_USER_G}" != "root" ]; then
+  # 活体：以控制台用户再起一个 App，3 秒后必须只剩一个（「开机自启」开关会触发这种情况）
+  sudo -u "${CONSOLE_USER_G}" "${APPX}" >/dev/null 2>&1 &
+  SPAWNED="${SPAWNED} $!"
+  sleep 3
+  n="$(pgrep -x FanPilot | grep -c . || true)"
+  [ "${n}" = "1" ] && ok "⭐活体：再启动一个 App 会自动退出（实例数恒为 1）" \
+                   || bad "存在 ${n} 个 FanPilot 实例 —— 菜单栏重复图标、资源翻倍"
+else
+  skip "菜单栏 App 未运行，跳过单实例活体验证"
+fi
+cnt_c(){ sed -E 's|^[[:space:]]*//.*$||' "${ROOT}/src/fanpilotd.c" | grep -c "$1" || true; }
+[ "$(cnt_c 'kCFRunLoopRunFinished')" != "0" ] \
+  && ok "主循环处理 run loop 立即返回的情形（不会变成 100% CPU 忙等）" \
+  || bad "主循环未处理 kCFRunLoopRunFinished —— 无事件源时会忙等"
 
 grp "回归 R14 —— 测试脚本自己留下孤儿守护（2026-09-14 真事故）"
 # 事故：R4 裸启动一个 fanpilotd（真守护当时已停 ⇒ flock 无人占 ⇒ 它成了真守护并阻塞）；
