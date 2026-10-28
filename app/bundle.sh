@@ -8,6 +8,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 APP="FanPilot.app"
+VER="$(cat ../VERSION)"      # 版本号唯一来源
 BIN=".build/release/FanPilotMenu"
 
 [ -x "${BIN}" ] || { echo "✗ 先 swift build -c release" >&2; exit 1; }
@@ -16,7 +17,7 @@ rm -rf "${APP}"
 mkdir -p "${APP}/Contents/MacOS" "${APP}/Contents/Resources"
 cp "${BIN}" "${APP}/Contents/MacOS/FanPilot"
 
-cat > "${APP}/Contents/Info.plist" <<'PLIST'
+cat > "${APP}/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -26,7 +27,7 @@ cat > "${APP}/Contents/Info.plist" <<'PLIST'
   <key>CFBundleIdentifier</key>            <string>com.newmac.fanpilot.menu</string>
   <key>CFBundleExecutable</key>            <string>FanPilot</string>
   <key>CFBundlePackageType</key>           <string>APPL</string>
-  <key>CFBundleShortVersionString</key>    <string>1.0</string>
+  <key>CFBundleShortVersionString</key>    <string>${VER}</string>
   <key>CFBundleVersion</key>               <string>1</string>
   <key>LSMinimumSystemVersion</key>        <string>13.0</string>
   <!-- 只在菜单栏出现，不进 Dock、不抢焦点 -->
