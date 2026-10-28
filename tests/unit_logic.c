@@ -1,7 +1,7 @@
 // unit_logic.c —— fanlogic.h 的单元测试（零依赖，clang 直接编）
 //
 // 覆盖原则：
-//   ① 每个函数的正常路径 + **边界** + 退化输入（0/负/NaN 风险）
+//   ① 每个函数的正常路径 + **边界** + 退化输入（NaN / 空 / 垃圾）
 //   ② 每个修过的 bug 都有一条**回归**测试，标 [回归]
 //   ③ 安全相关的必须有**反向**测试：不该生效的必须真的不生效
 //
@@ -13,500 +13,191 @@
 #include "../src/fanlogic.h"
 
 static int g_pass = 0, g_fail = 0;
-static const char *g_group = "";
 
-static void group(const char *g){ g_group = g; printf("\n── %s\n", g); }
-
+static void group(const char *g){ printf("\n── %s\n", g); }
 static void ok(int cond, const char *what){
     if (cond) { g_pass++; printf("  ✅ %s\n", what); }
     else      { g_fail++; printf("  ❌ %s\n", what); }
 }
 static void eqd(double got, double want, double tol, const char *what){
-    int c = fabs(got - want) <= tol;
-    if (c) { g_pass++; printf("  ✅ %s (=%.2f)\n", what, got); }
-    else   { g_fail++; printf("  ❌ %s: 得到 %.4f，期望 %.4f (±%.4f)\n", what, got, want, tol); }
+    if (fabs(got - want) <= tol) { g_pass++; printf("  ✅ %s (=%.2f)\n", what, got); }
+    else { g_fail++; printf("  ❌ %s: 得到 %.4f，期望 %.4f\n", what, got, want); }
 }
 
+#define HW_MIN  1350.0
 #define HW_MAX0 5349.0   // 实测本机风扇0 上限
 #define HW_MAX1 5777.0   // 实测本机风扇1 上限
-#define HW_MIN  1350.0
 
-// ═══════════════════════════════════════════════════════════════════
-static void test_cfg_clamp(void){
-    group("fl_cfg_clamp —— 配置是不可信输入，安全阈值必须硬夹");
-
-    // [回归] 恶意/手误配置不得绕过保护
+static fl_cfg parsed(const char *text){
     fl_cfg c; fl_cfg_defaults(&c);
-    c.emergency_temp = 200;  fl_cfg_clamp(&c);
-    eqd(c.emergency_temp, 95, 0.001, "[回归] emergency_temp 200 → 95（不许把紧急保护调没）");
-
-    fl_cfg_defaults(&c); c.emergency_temp = 10; fl_cfg_clamp(&c);
-    eqd(c.emergency_temp, 70, 0.001, "emergency_temp 10 → 70（不许低到天天误触发）");
-
-    fl_cfg_defaults(&c); c.poll_interval = 0.01; fl_cfg_clamp(&c);
-    eqd(c.poll_interval, 0.5, 0.001, "[回归] poll_interval 0.01 → 0.5（别把守护写成 CPU 大户）");
-
-    fl_cfg_defaults(&c); c.poll_interval = 999; fl_cfg_clamp(&c);
-    eqd(c.poll_interval, 30, 0.001, "poll_interval 999 → 30（太慢来不及响应升温）");
-
-    fl_cfg_defaults(&c); c.ema_seconds = 9999; fl_cfg_clamp(&c);
-    eqd(c.ema_seconds, 120, 0.001, "[回归] ema_seconds 9999 → 120（平滑过久等于不响应）");
-
-    fl_cfg_defaults(&c); c.ema_seconds = 0; fl_cfg_clamp(&c);
-    eqd(c.ema_seconds, 1, 0.001, "ema_seconds 0 → 1（不得为 0，会除零）");
-
-    fl_cfg_defaults(&c); c.deadband = 99999; fl_cfg_clamp(&c);
-    eqd(c.deadband, 500, 0.001, "[回归] deadband 99999 → 500（死区过大等于不控制）");
-
-    fl_cfg_defaults(&c); c.deadband = -5; fl_cfg_clamp(&c);
-    eqd(c.deadband, 0, 0.001, "deadband -5 → 0（负死区无意义）");
-
-    fl_cfg_defaults(&c); c.slew_up = 1; fl_cfg_clamp(&c);
-    eqd(c.slew_up, 10, 0.001, "[回归] slew_up 1 → 10（太小等于升不上去）");
-
-    // ⭐ 反向：夹取不能误伤合法配置（只夹越界的，别顺手改对的）
-    fl_cfg_defaults(&c);
-    fl_cfg d = c;
+    char buf[2048]; strncpy(buf, text, sizeof buf - 1); buf[sizeof buf - 1] = 0;
+    for (char *save = NULL, *l = strtok_r(buf, "\n", &save); l; l = strtok_r(NULL, "\n", &save))
+        fl_cfg_parse_line(&c, l);
     fl_cfg_clamp(&c);
-    ok(c.poll_interval == d.poll_interval && c.min_rpm == d.min_rpm &&
-       c.max_rpm == d.max_rpm && c.ema_seconds == d.ema_seconds &&
-       c.slew_up == d.slew_up && c.slew_down == d.slew_down &&
-       c.deadband == d.deadband && c.emergency_temp == d.emergency_temp,
-       "⭐反向：默认（合法）配置经夹取后**一字未改**");
+    return c;
 }
 
-// ═══════════════════════════════════════════════════════════════════
-static void test_curve_rescale(void){
-    group("fl_curve_rescale —— 抬高下限时整条曲线重新铺开（用户诉求）");
+static void test_parse(void){
+    group("配置解析 —— 单一百分比");
+    fl_cfg c = parsed("percent = 85\n");
+    eqd(c.percent, 85, 0.01, "percent = 85");
+    c = parsed("percent=88\n");
+    eqd(c.percent, 88, 0.01, "无空格写法也认");
+    c = parsed("percent = 50%\n");
+    eqd(c.percent, 50, 0.01, "允许写成 50%");
+    c = parsed("percent = 62.5\n");
+    eqd(c.percent, 62.5, 0.01, "小数也认");
+    c = parsed("percent = abc\n");
+    eqd(c.percent, FL_DEFAULT_PCT, 0.01, "⭐垃圾值 → 保留默认（不静默变成 0%）");
+    c = parsed("percent = 85abc\n");
+    eqd(c.percent, FL_DEFAULT_PCT, 0.01, "数字后跟垃圾 → 整体无效，保留默认");
+    c = parsed("percent = 70   # 注释里有数字 kill -9 20\n");
+    eqd(c.percent, 70, 0.01, "[回归] 注释先剥再解析（1.x 注释数字被吃进解析器）");
+    c = parsed("# percent = 10\npercent = 60\n");
+    eqd(c.percent, 60, 0.01, "整行注释不生效");
+    c = parsed("percent = 60\r\n");
+    eqd(c.percent, 60, 0.01, "CRLF 行尾也认");
+    c = parsed("fan_mode = curve\nmin_rpm = 2500\nrpm = 4549, 4891\npercent = 40\n");
+    eqd(c.percent, 40, 0.01, "旧版已删除的键（含 2.0 草案的 rpm）被忽略，不干扰");
 
-    // 下限 2000（默认）：端点应为 2000 与硬件上限
-    fl_cfg c; fl_cfg_defaults(&c);
-    fl_curve_rescale(&c, HW_MAX0);
-    eqd(c.curve[0].rpm, 2000, 0.5, "下限2000: 45°C → 2000");
-    eqd(c.curve[4].rpm, HW_MAX0, 0.5, "下限2000: 85°C → 硬件上限 5349");
+    c = parsed("emergency_source = max\n");
+    ok(c.emergency_source == 0, "emergency_source = max");
+    c = parsed("emergency_source = average\n");
+    ok(c.emergency_source == 1, "emergency_source = average");
+    c = parsed("emergency_source = 乱写\n");
+    ok(c.emergency_source == 0, "未知口径 → 最热核（保守方向）");
+    c = parsed("");
+    ok(c.emergency_source == 1, "默认口径 = 全核平均（使用者 2026-09-14 决定）");
 
-    // ⭐ 核心诉求：下限 3000 时中间段**不得出现死区**（相邻点必须严格递增）
-    fl_cfg_defaults(&c); c.min_rpm = 3000;
-    fl_curve_rescale(&c, HW_MAX0);
-    eqd(c.curve[0].rpm, 3000,    0.5, "下限3000: 45°C → 3000");
-    eqd(c.curve[4].rpm, HW_MAX0, 0.5, "下限3000: 85°C → 5349");
-    int strictly_up = 1;
-    for (int i = 1; i < c.n_curve; i++)
-        if (!(c.curve[i].rpm > c.curve[i-1].rpm + 1)) strictly_up = 0;
-    ok(strictly_up, "⭐下限3000: 5 个点严格递增 —— **无死区**（这是重铺的目的）");
-    printf("      重铺后: ");
-    for (int i = 0; i < c.n_curve; i++) printf("%.0f°C:%.0f  ", c.curve[i].t, c.curve[i].rpm);
-    printf("\n");
-
-    // 下限 4000（更极端）仍不得出现死区
-    fl_cfg_defaults(&c); c.min_rpm = 4000;
-    fl_curve_rescale(&c, HW_MAX0);
-    strictly_up = 1;
-    for (int i = 1; i < c.n_curve; i++)
-        if (!(c.curve[i].rpm > c.curve[i-1].rpm + 1)) strictly_up = 0;
-    ok(strictly_up, "下限4000: 仍严格递增");
-    eqd(c.curve[0].rpm, 4000, 0.5, "下限4000: 起点 4000");
-
-    // 两个风扇上限不同 ⇒ 用各自的（实测 5349 vs 5777）
-    fl_cfg_defaults(&c); c.min_rpm = 2000;
-    fl_cfg c1 = c;
-    fl_curve_rescale(&c,  HW_MAX0);
-    fl_curve_rescale(&c1, HW_MAX1);
-    ok(fabs(c1.curve[4].rpm - HW_MAX1) < 0.5 && fabs(c.curve[4].rpm - HW_MAX0) < 0.5,
-       "[回归] 两风扇上限不同(5349/5777)时各自铺到自己的上限，不写死同值");
-
-    // max_rpm 显式设定时优先于硬件上限
-    fl_cfg_defaults(&c); c.max_rpm = 4000;
-    fl_curve_rescale(&c, HW_MAX0);
-    eqd(c.curve[4].rpm, 4000, 0.5, "显式 max_rpm=4000 时铺到 4000，不到硬件 5349");
-
-    // ⭐ 幂等性：重铺两次结果相同（第一次后 lo=min、hi=hi，第二次映射是恒等）
-    fl_cfg_defaults(&c); c.min_rpm = 3000;
-    fl_curve_rescale(&c, HW_MAX0);
-    fl_cfg once = c;
-    fl_curve_rescale(&c, HW_MAX0);
-    int same = 1;
-    for (int i = 0; i < c.n_curve; i++)
-        if (fabs(c.curve[i].rpm - once.curve[i].rpm) > 0.001) same = 0;
-    ok(same, "⭐幂等：连续重铺两次结果完全相同（我最初误以为会漂移，实测不会）");
-
-    // autoscale=0 ⇒ 曲线原样不动（手工调过的不被改写）
-    fl_cfg_defaults(&c); c.min_rpm = 3000; c.curve_autoscale = 0;
-    double before = c.curve[0].rpm;
-    fl_curve_rescale(&c, HW_MAX0);
-    eqd(c.curve[0].rpm, before, 0.001, "[反向] autoscale=0 时曲线一点不改（手工曲线受保护）");
-
-    // 退化输入不得产生 NaN / 崩溃
-    fl_cfg_defaults(&c); for (int i=0;i<c.n_curve;i++) c.curve[i].rpm = 2500;  // 平模板
-    fl_curve_rescale(&c, HW_MAX0);
-    ok(!isnan(c.curve[0].rpm) && fabs(c.curve[0].rpm - c.min_rpm) < 0.5,
-       "退化：平模板（无形状）→ 全给下限，无 NaN（除零防护）");
-
-    fl_cfg_defaults(&c); c.min_rpm = 6000;   // 下限高于硬件上限
-    fl_curve_rescale(&c, HW_MAX0);
-    ok(!isnan(c.curve[0].rpm) && fabs(c.curve[0].rpm - 6000) < 0.5,
-       "退化：下限高于上限 → 全给下限，无 NaN");
-
-    fl_cfg_defaults(&c); c.n_curve = 0;
-    fl_curve_rescale(&c, HW_MAX0);
-    ok(1, "退化：n_curve=0 不崩");
+    fl_cfg d;
+    ok(fl_cfg_load("/nonexistent/fanpilot.conf", &d) == -1, "配置文件不存在 → 返回 -1（供调用方留痕）");
+    eqd(d.percent, FL_DEFAULT_PCT, 0.01, "配置文件不存在 → 默认 50%");
 }
 
-// ═══════════════════════════════════════════════════════════════════
-static void test_temp_source(void){
-    group("温度口径三档 —— 曲线口径可切(max/average/min)，紧急判据用独立设置");
-    fl_cfg c; fl_cfg_defaults(&c);
+static void test_clamp(void){
+    group("fl_cfg_clamp —— 不可信输入，安全阈值硬夹（反向断言）");
+    fl_cfg c = parsed("emergency_temp = 200\n");
+    eqd(c.emergency_temp, FL_EMERG_MAX, 0.01, "[回归] emergency_temp 200 → 95（不许把保护调没）");
+    c = parsed("emergency_temp = 10\n");
+    eqd(c.emergency_temp, FL_EMERG_MIN, 0.01, "emergency_temp 10 → 70");
+    c = parsed("emergency_temp = nan\n");
+    eqd(c.emergency_temp, FL_EMERG_MIN, 0.01, "emergency_temp NaN → 70（NaN 不得绕过比较）");
+    c = parsed("check_interval = 0.01\n");
+    eqd(c.check_interval, FL_CHECK_MIN, 0.01, "check_interval 0.01 → 5（别把守护写成 CPU 大户）");
+    c = parsed("check_interval = 9999\n");
+    eqd(c.check_interval, FL_CHECK_MAX, 0.01, "check_interval 9999 → 60（过热响应不能更慢）");
+    c = parsed("percent = 500\n");
+    eqd(c.percent, 100, 0.01, "percent 500 → 100");
+    c = parsed("percent = -5\n");
+    eqd(c.percent, 0, 0.01, "percent -5 → 0（再由硬件下限兜底，不会停转）");
+    c = parsed("percent = nan\n");
+    eqd(c.percent, FL_DEFAULT_PCT, 0.01, "percent NaN → 默认 50%");
+}
 
+static void test_target(void){
+    group("fl_fan_target —— 百分比 × 各风扇自己的硬件上限");
+    fl_cfg c = parsed("percent = 85\n");
+    eqd(fl_fan_target(&c, HW_MIN, HW_MAX0, 0), 4547, 0.01, "85% × 5349 = 4547（风扇0）");
+    eqd(fl_fan_target(&c, HW_MIN, HW_MAX1, 0), 4910, 0.01, "85% × 5777 = 4910（风扇1）—— 同一百分比，两风扇各自折算");
+    c = parsed("percent = 88\n");
+    eqd(fl_fan_target(&c, HW_MIN, HW_MAX0, 0), 4707, 0.01, "88% × 5349 = 4707（四舍五入到 1 RPM）");
+    c = parsed("percent = 100\n");
+    eqd(fl_fan_target(&c, HW_MIN, HW_MAX1, 0), HW_MAX1, 0.01, "100% = 硬件上限");
+    c = parsed("percent = 10\n");
+    eqd(fl_fan_target(&c, HW_MIN, HW_MAX0, 0), HW_MIN, 0.01, "10%（535）低于 F*Mn → 夹到硬件下限 1350，不会停转");
+    c = parsed("percent = 0\n");
+    eqd(fl_fan_target(&c, HW_MIN, HW_MAX0, 0), HW_MIN, 0.01, "0% → 硬件下限");
+    c = parsed("percent = 30\n");
+    eqd(fl_fan_target(&c, HW_MIN, HW_MAX0, 1), HW_MAX0, 0.01, "⭐紧急 → 无视配置直接打满");
+}
 
-
-    // 三档口径（本机实测量级：最高 82.2 / 平均 72.6 / 最低 58.2，最高-最低 ≈ 24°C）
-    double hi = 82.2, av = 72.6, lo = 58.2;
-    eqd(fl_pick_temp(0, hi, av, lo), hi, 0.001, "口径 max  → 最高核 82.2");
-    eqd(fl_pick_temp(1, hi, av, lo), av, 0.001, "口径 average → 全核平均 72.6");
-    eqd(fl_pick_temp(2, hi, av, lo), lo, 0.001, "口径 min  → 最低核 58.2");
-    eqd(fl_pick_temp(99, hi, av, lo), hi, 0.001, "未知口径 → 退回 max（保守方向）");
-
-    fl_cfg_defaults(&c);
-    for (int sc = 0; sc <= 2; sc++) {
-        c.temp_source = sc;
-        eqd(fl_control_temp(&c, hi, av, lo), fl_pick_temp(sc, hi, av, lo), 0.001,
-            sc==0?"曲线口径 max 生效":(sc==1?"曲线口径 average 生效":"曲线口径 min 生效"));
+static void test_emergency(void){
+    group("fl_emergency_next —— 紧急判定带 5°C 回差");
+    fl_cfg c = parsed("emergency_temp = 90\n");
+    ok(fl_emergency_next(&c, 0, 89.9) == 0, "89.9°C 未达阈值");
+    ok(fl_emergency_next(&c, 0, 90.0) == 1, "90.0°C 进入紧急");
+    ok(fl_emergency_next(&c, 1, 87.0) == 1, "[回差] 紧急中降到 87°C 仍保持（不在阈值附近横跳）");
+    ok(fl_emergency_next(&c, 0, 87.0) == 0, "[回差] 非紧急时 87°C 不会进入");
+    ok(fl_emergency_next(&c, 1, 84.9) == 0, "降到 84.9°C（< 阈值-5）才解除");
+    // 横跳模拟：温度在 89~91 抖 20 次，状态切换次数必须 ≤ 1
+    int st = 0, flips = 0;
+    for (int i = 0; i < 20; i++) {
+        int n = fl_emergency_next(&c, st, (i % 2) ? 91.0 : 89.0);
+        if (n != st) flips++;
+        st = n;
     }
+    ok(flips == 1, "温度在 89/91 抖 20 次只切换 1 次（无回差时会是 20 次）");
 
-    // 🔴 核心安全断言：紧急判据用**独立**的 emergency_source，不跟随 temp_source
-    fl_cfg_defaults(&c); c.emergency_temp = 90;
-    c.temp_source = 2;            // 曲线看最低核（使用者选定）
-    c.emergency_source = 1;       // 紧急仍看平均（默认，独立）
-    ok(!fl_is_emergency(&c, 95.0, 85.0, 62.0),
-       "曲线=min 时：平均 85 < 90 ⇒ 不触发（紧急看的是平均，不是最低核 62）");
-    ok( fl_is_emergency(&c, 99.0, 90.0, 66.0),
-       "曲线=min 时：平均升到 90 ⇒ 触发（证明紧急没跟着 min 走）");
-
-    // ⭐ 为什么必须拆开：若紧急也用 min，实测温差 ~24°C ⇒ 保护等于关掉
-    c.emergency_source = 2;
-    ok(!fl_is_emergency(&c, 110.0, 95.0, 89.0),
-       "⚠️[量化] 若紧急也用 min：最高核 110°C、平均 95°C 时**仍不触发**"
-       " —— 这就是把两个口径拆开的理由");
-    c.emergency_source = 0;
-    ok( fl_is_emergency(&c, 110.0, 95.0, 89.0), "同一输入下 emergency_source=max 会触发");
-
-    // 默认值确认
-    fl_cfg_defaults(&c);
-    ok(c.temp_source == 1 && c.emergency_source == 1,
-       "默认：曲线与紧急都用 average（使用者 2026-09-14 的决定）");
+    eqd(fl_pick_temp(0, 95, 80, 60), 95, 0.01, "口径 max");
+    eqd(fl_pick_temp(1, 95, 80, 60), 80, 0.01, "口径 average");
+    eqd(fl_pick_temp(2, 95, 80, 60), 60, 0.01, "口径 min");
 }
 
-// ═══════════════════════════════════════════════════════════════════
-static void test_fixed_mode(void){
-    group("定死转速模式 fan_mode=fixed —— 目标恒定 ⇒ 稳态写入 0 次");
+static void test_rewrite(void){
+    group("fl_needs_rewrite —— 定速 = 写一次；只在回读不符时重写");
+    ok(fl_needs_rewrite(1, 4549, 4549) == 0, "⭐稳态：md=1 且 Tg 一致 → 不写");
+    ok(fl_needs_rewrite(1, 4549 + FL_REWRITE_TOLERANCE, 4549) == 0, "偏差恰在容差内 → 不写");
+    ok(fl_needs_rewrite(1, 3100, 3150) == 1, "[回归] 改档只差 50 RPM 也必须写（初版容差 50 时不写）");
+    ok(fl_needs_rewrite(1, 3100, 3101.5) == 1, "改档差 1.5 RPM → 写");
+    ok(fl_needs_rewrite(1, 3000, 4549) == 1, "Tg 被别的程序改了 → 重写");
+    ok(fl_needs_rewrite(0, 4549, 4549) == 1, "md=0（被交还固件 / 睡醒）→ 重写");
+    ok(fl_needs_rewrite(-1, 4549, 4549) == 1, "md 读失败 → 按需要写（宁可多写不脱管）");
 
-    fl_cfg c; fl_cfg_defaults(&c);
-    ok(c.fan_mode == FL_MODE_CURVE, "默认仍是自适应曲线（不改变既有行为）");
-    ok(c.emergency_override == 1, "默认保留紧急打满（降低写入 ≠ 放弃过热保护）");
-
-    // 定死模式：目标与温度**完全无关**
-    fl_cfg_defaults(&c); c.fan_mode = FL_MODE_FIXED; c.fixed_rpm = 3000;
-    eqd(fl_target_rpm(&c, 30),  3000, 0.001, "30°C  → 3000（不看温度）");
-    eqd(fl_target_rpm(&c, 60),  3000, 0.001, "60°C  → 3000");
-    eqd(fl_target_rpm(&c, 88),  3000, 0.001, "88°C  → 3000");
-    eqd(fl_target_rpm(&c, 150), 3000, 0.001, "150°C → 3000（极端值也不变）");
-
-    // 反向：曲线模式下 fl_target_rpm 必须仍走曲线（新函数不能吃掉旧行为）
-    fl_cfg d; fl_cfg_defaults(&d); d.curve_autoscale = 0;
-    eqd(fl_target_rpm(&d, 45), fl_curve_eval(&d, 45), 0.001, "⭐反向：curve 模式仍按曲线取值(45°C)");
-    eqd(fl_target_rpm(&d, 75), fl_curve_eval(&d, 75), 0.001, "⭐反向：curve 模式仍按曲线取值(75°C)");
-    ok(fl_target_rpm(&d, 45) != fl_target_rpm(&d, 75), "⭐反向：curve 模式下不同温度给不同转速");
-
-    // 🔑 核心诉求：稳态写入必须为 0（这是加这一档的**全部理由**）
-    fl_cfg_defaults(&c); c.fan_mode = FL_MODE_FIXED; c.fixed_rpm = 3000;
-    fl_cfg_clamp(&c);
-    double cur = HW_MIN, last = -1; int writes = 0, ramp_writes = 0;
-    for (int i = 0; i < 300; i++) {                       // 300 周期 = 10 分钟
-        double want = fl_target_rpm(&c, 55 + (i % 30));   // 温度大幅波动
-        double tgt  = fl_clamp_fan(&c, HW_MIN, HW_MAX0, want, 0);
-        tgt = fl_slew(&c, cur, tgt, c.poll_interval, 0);
-        cur = tgt;
-        if (fl_should_write(&c, last, tgt)) { last = tgt; writes++; if (i < 30) ramp_writes++; }
+    // 端到端模拟：1 天的 10s 巡检（8640 次），无外部扰动 ⇒ 写入只有起步那 1 次
+    double tg = -1; int md = 0, writes = 0;
+    for (int i = 0; i < 8640; i++) {
+        if (fl_needs_rewrite(md, tg, 4549)) { md = 1; tg = 4549; writes++; }
     }
-    printf("      300 周期共写 %d 次（其中前 30 周期爬升占 %d 次）\n", writes, ramp_writes);
-    ok(writes == ramp_writes,
-       "⭐定死模式：爬升结束后**再也不写** —— 300 周期内全部写入都发生在爬升段");
-    ok(writes < 15, "爬升段写入次数很少（受限幅+死区约束）");
-
-    // 对照：同样 300 周期的曲线模式必然持续写入
-    fl_cfg e; fl_cfg_defaults(&e); fl_cfg_clamp(&e); fl_curve_rescale(&e, HW_MAX0);
-    cur = HW_MIN; last = -1; int cwrites = 0;
-    for (int i = 0; i < 300; i++) {
-        double want = fl_target_rpm(&e, 55 + (i % 30));
-        double tgt  = fl_clamp_fan(&e, HW_MIN, HW_MAX0, want, 0);
-        tgt = fl_slew(&e, cur, tgt, e.poll_interval, 0);
-        cur = tgt;
-        if (fl_should_write(&e, last, tgt)) { last = tgt; cwrites++; }
-    }
-    printf("      对照：曲线模式同样 300 周期写 %d 次\n", cwrites);
-    ok(cwrites > writes * 3,
-       "⭐量化对照：曲线模式写入次数远多于定死模式（这就是要加这一档的理由）");
-
-    // 紧急保护：默认仍生效，可显式关闭
-    fl_cfg_defaults(&c); c.fan_mode = FL_MODE_FIXED;
-    ok(fl_emergency_active(&c), "定死模式默认**仍有**紧急保护");
-    c.emergency_override = 0;
-    ok(!fl_emergency_active(&c), "显式关闭后紧急保护不生效（使用者的知情选择）");
-    fl_cfg_defaults(&c);                       // 曲线模式
-    c.emergency_override = 0;
-    ok(fl_emergency_active(&c),
-       "🔴 曲线模式下 emergency_override=0 **无效** —— 保护不可被关掉");
-
-    // 夹取：fixed_rpm 越界必须被硬件范围收住，且紧急仍能打满
-    fl_cfg_defaults(&c); c.fan_mode = FL_MODE_FIXED; c.fixed_rpm = 99999;
-    fl_cfg_clamp(&c);
-    eqd(fl_clamp_fan(&c, HW_MIN, HW_MAX0, fl_target_rpm(&c, 50), 0), HW_MAX0, 0.001,
-        "fixed_rpm 过大 → 夹到风扇0 硬件上限 5349");
-    eqd(fl_clamp_fan(&c, HW_MIN, HW_MAX1, fl_target_rpm(&c, 50), 0), HW_MAX1, 0.001,
-        "[回归] 风扇1 夹到它**自己**的上限 5777，不写死同值");
-
-    fl_cfg_defaults(&c); c.fan_mode = FL_MODE_FIXED; c.fixed_rpm = 1;
-    fl_cfg_clamp(&c);
-    eqd(c.fixed_rpm, 1000, 0.001, "fixed_rpm 过小 → 夹到 1000（低于此值形同不散热）");
-
-    // 未知模式值退回 curve（保守方向）
-    fl_cfg_defaults(&c); c.fan_mode = 77; fl_cfg_clamp(&c);
-    ok(c.fan_mode == FL_MODE_CURVE, "未知 fan_mode → 退回 curve（保守：自适应不会闷住机器）");
+    ok(writes == 1, "模拟 1 天 8640 次巡检：写 SMC 恰 1 次");
 }
 
-// ═══════════════════════════════════════════════════════════════════
-static void test_curve_eval(void){
-    group("fl_curve_eval —— 分段线性插值");
-    fl_cfg c; fl_cfg_defaults(&c); c.curve_autoscale = 0;   // 用原始模板便于对数
+static void test_storm_guards(void){
+    group("🔴 防写入风暴 —— 令牌桶 + 抢写让步");
+    fl_bucket b; fl_bucket_init(&b, 0);
+    int got = 0;
+    for (int i = 0; i < 1000; i++) got += fl_bucket_take(&b, 0, 1);
+    ok(got == (int)FL_WRITE_BURST, "同一时刻狂写 1000 次 → 只放行 FL_WRITE_BURST 次（突发上限）");
+    got = 0;
+    for (int s = 1; s <= 3600; s++) got += fl_bucket_take(&b, s, 1);   // bug：每秒都想写
+    ok(got <= (int)FL_WRITE_PER_HOUR + 1, "每秒都想写、持续 1 小时 → 放行 ≤ 速率上限 +1（长期速率上限）");
+    fl_bucket_init(&b, 0);
+    ok(fl_bucket_take(&b, 0, 4), "起步一次写 4 个键 → 放行");
+    ok(fl_bucket_take(&b, 1e7, 1) && b.tokens <= FL_WRITE_BURST, "久不写之后回补不超过容量");
+    // 模拟「每 10s 巡检都发现被外部改动」1 天：令牌桶下写入 ≤ 突发 + 24×60
+    fl_bucket_init(&b, 0); got = 0;
+    for (int t = 0; t < 86400; t += 10) got += 2 * fl_bucket_take(&b, t, 2);
+    ok(got <= FL_WRITE_BURST + 24 * FL_WRITE_PER_HOUR + 2, "抢写 1 天：写入被压到 ≤ ~2922 次（1.x 是 2.3 万次）");
+    // 人的正常操作不能被防线挡住：连续改 15 次档（每次 2 个键）必须全部放行
+    fl_bucket_init(&b, 0); got = 0;
+    for (int i = 0; i < 15; i++) got += fl_bucket_take(&b, i, 2);
+    ok(got == 15, "[回归] 连续改档 15 次全部放行（初版容量 16 时第 9 次起被挡）");
 
-    eqd(fl_curve_eval(&c, 20), 2000, 0.001, "低于首点(20°C) → 首点值 2000");
-    eqd(fl_curve_eval(&c, 45), 2000, 0.001, "首点(45°C) 精确 2000");
-    eqd(fl_curve_eval(&c, 50), 2300, 0.001, "45~55 中点(50°C) → 2300（线性）");
-    eqd(fl_curve_eval(&c, 55), 2600, 0.001, "端点(55°C) 精确 2600");
-    eqd(fl_curve_eval(&c, 60), 3000, 0.001, "55~65 中点(60°C) → 3000");
-    eqd(fl_curve_eval(&c, 85), 5300, 0.001, "末点(85°C) 精确 5300");
-    eqd(fl_curve_eval(&c, 150), 5300, 0.001, "高于末点(150°C) → 末点值（不外插）");
-
-    // 单调性：整个区间内不得回落
-    double prev = -1; int mono = 1;
-    for (double t = 0; t <= 120; t += 0.5) {
-        double v = fl_curve_eval(&c, t);
-        if (v < prev - 0.001) mono = 0;
-        prev = v;
+    fl_fight g; fl_fight_init(&g);
+    ok(fl_fight_note(&g, 0) == 0 && fl_fight_note(&g, 100) == 0, "外部改动 2 次 → 还不让步");
+    ok(fl_fight_note(&g, 200) == 1, "10 分钟内第 3 次 → 进入让步");
+    ok(fl_fight_yielding(&g, 200 + 1799), "让步持续 30 分钟");
+    ok(!fl_fight_yielding(&g, 200 + 1800), "30 分钟后恢复接管");
+    fl_fight_init(&g);
+    fl_fight_note(&g, 0); fl_fight_note(&g, 700); 
+    ok(fl_fight_note(&g, 1400) == 0, "零散改动（间隔 > 10 分钟）不算抢写（如每次睡醒 SMC 复位）");
+    // 抢写 1 天：每 10s 被改一次。有让步时纠正写入次数 ≈ 每 30 分钟 3 次
+    fl_fight_init(&g); int writes = 0;
+    for (int t = 0; t < 86400; t += 10) {
+        if (fl_fight_yielding(&g, t)) continue;
+        writes += 2;
+        fl_fight_note(&g, t);
     }
-    ok(mono, "⭐0~120°C 全程单调不回落（回落会导致温度升高反而降速）");
-
-    // 退化
-    fl_cfg d; fl_cfg_defaults(&d); d.n_curve = 0;
-    eqd(fl_curve_eval(&d, 60), d.min_rpm, 0.001, "退化：无曲线点 → 返回下限");
-
-    fl_cfg e; fl_cfg_defaults(&e); e.n_curve = 1; e.curve[0].t = 50; e.curve[0].rpm = 2222;
-    eqd(fl_curve_eval(&e, 10),  2222, 0.001, "退化：单点曲线，低温侧");
-    eqd(fl_curve_eval(&e, 100), 2222, 0.001, "退化：单点曲线，高温侧");
-
-    fl_cfg f; fl_cfg_defaults(&f); f.n_curve = 2;
-    f.curve[0].t = 50; f.curve[0].rpm = 2000;
-    f.curve[1].t = 50; f.curve[1].rpm = 3000;      // 重复温度点
-    ok(!isnan(fl_curve_eval(&f, 50)), "退化：重复温度点不产生 NaN（除零防护）");
-}
-
-// ═══════════════════════════════════════════════════════════════════
-static void test_clamp_fan(void){
-    group("fl_clamp_fan —— 值域夹取 + 紧急路径不受用户上限约束");
-    fl_cfg c; fl_cfg_defaults(&c);
-
-    eqd(fl_clamp_fan(&c, HW_MIN, HW_MAX0, 500, 0),  2000, 0.001, "低于下限 → 下限 2000");
-    eqd(fl_clamp_fan(&c, HW_MIN, HW_MAX0, 9999, 0), HW_MAX0, 0.001, "高于硬件上限 → 5349");
-    eqd(fl_clamp_fan(&c, HW_MIN, HW_MAX0, 3000, 0), 3000, 0.001, "区间内原值通过");
-
-    c.max_rpm = 3000;
-    eqd(fl_clamp_fan(&c, HW_MIN, HW_MAX0, 5000, 0), 3000, 0.001, "非紧急：受用户 max_rpm=3000 约束");
-    // 🔴 [回归] 这是修过的安全洞：紧急打满不得被用户上限挡住
-    eqd(fl_clamp_fan(&c, HW_MIN, HW_MAX0, 9999, 1), HW_MAX0, 0.001,
-        "🔴[回归] 紧急态**忽略**用户 max_rpm，铺到硬件上限 5349");
-
-    // 下限低于硬件下限时应取硬件下限
-    fl_cfg d; fl_cfg_defaults(&d); d.min_rpm = 500;
-    eqd(fl_clamp_fan(&d, HW_MIN, HW_MAX0, 100, 0), HW_MIN, 0.001,
-        "配置下限低于硬件下限 → 取硬件下限 1350");
-
-    // hi < lo 的矛盾配置不得返回荒谬值
-    fl_cfg e; fl_cfg_defaults(&e); e.min_rpm = 5000; e.max_rpm = 2000;
-    double v = fl_clamp_fan(&e, HW_MIN, HW_MAX0, 3000, 0);
-    ok(v >= 2000 && v <= HW_MAX0 && !isnan(v),
-       "矛盾配置(下限5000>上限2000)仍返回合法范围内的值");
-}
-
-// ═══════════════════════════════════════════════════════════════════
-static void test_ema(void){
-    group("fl_ema —— 指数平滑");
-    eqd(fl_ema(-1, 57, 0.13), 57, 0.001, "首次(prev<0) 直接取原值，不从 0 慢爬");
-    eqd(fl_ema(50, 60, 1.0),  60, 0.001, "alpha=1 → 完全跟随");
-    eqd(fl_ema(50, 60, 0.0),  50, 0.001, "alpha=0 → 完全不动");
-    eqd(fl_ema(50, 60, 0.5),  55, 0.001, "alpha=0.5 → 取中");
-    eqd(fl_ema(50, 60, 5.0),  60, 0.001, "alpha 越界(5.0) 被夹到 1");
-    eqd(fl_ema(50, 60, -3.0), 50, 0.001, "alpha 越界(-3) 被夹到 0");
-
-    // 收敛性：持续喂同一值应逼近它
-    double v = 30; for (int i = 0; i < 200; i++) v = fl_ema(v, 70, 2.0/15.0);
-    eqd(v, 70, 0.5, "持续喂 70°C 两百轮后收敛到 70");
-}
-
-// ═══════════════════════════════════════════════════════════════════
-static void test_slew(void){
-    group("fl_slew —— 非对称变化率限幅（升快降慢，这是「丝滑」的关键）");
-    fl_cfg c; fl_cfg_defaults(&c);   // up=200 down=60 RPM/s
-    double dt = 2.0;                  // 2s 周期 ⇒ 单周期最多 +400 / -120
-
-    eqd(fl_slew(&c, 2000, 5000, dt, 0), 2400, 0.001, "升速被限：一周期最多 +400");
-    eqd(fl_slew(&c, 3000, 1000, dt, 0), 2880, 0.001, "降速被限：一周期最多 -120");
-    eqd(fl_slew(&c, 2000, 2100, dt, 0), 2100, 0.001, "小变化(100<400) 直接到位");
-    ok(fabs(fl_slew(&c,2000,5000,dt,0)-2000) > fabs(fl_slew(&c,3000,1000,dt,0)-3000),
-       "⭐非对称：升速步长(400) > 降速步长(120)");
-    // 🔴 [回归] 紧急态必须无视限幅，立刻打满
-    eqd(fl_slew(&c, 2000, 5349, dt, 1), 5349, 0.001,
-        "🔴[回归] 紧急态忽略限幅，一步到位（保护优先于丝滑）");
-    eqd(fl_slew(&c, 2000, 2000, dt, 0), 2000, 0.001, "无变化 → 不动");
-}
-
-// ═══════════════════════════════════════════════════════════════════
-static void test_should_write(void){
-    group("fl_should_write —— 死区抑制无谓 SMC 写入");
-    fl_cfg c; fl_cfg_defaults(&c);   // deadband=50
-
-    ok(fl_should_write(&c, -1, 2000),  "首次(last<0) 必须写");
-    ok(!fl_should_write(&c, 2000, 2030), "[回归] 变化 30 < 死区 50 → 不写");
-    ok(fl_should_write(&c, 2000, 2100),  "变化 100 > 死区 50 → 写");
-    ok(!fl_should_write(&c, 2000, 2050), "边界：变化恰好=死区 → 不写（严格大于才写）");
-    ok(fl_should_write(&c, 2000, 2051),  "边界：死区+1 → 写");
-    ok(!fl_should_write(&c, 2000, 1970), "反向变化 30 也不写（取绝对值）");
-    ok(fl_should_write(&c, 2000, 1900),  "反向变化 100 要写");
-}
-
-// ═══════════════════════════════════════════════════════════════════
-static void test_fault(void){
-    group("fl_fault_check —— 风扇故障状态机");
-    fl_fan_state s; fl_fan_state_init(&s);
-    double now = 1000;
-
-    // 正常跟随不报
-    for (int i = 0; i < 20; i++) { now += 2; fl_fault_check(&s, 2000, 1990, now, NULL); }
-    ok(!s.fault, "正常跟随(1990/2000) 20 周期后不报故障");
-
-    // 🔴 [回归] 爬升宽限期内不得误报（实测硬件 0→2500 需 6~9s）
-    fl_fan_state_init(&s); now = 1000;
-    fl_note_target(&s, 4000, now);                 // 目标从 0 大幅上调
-    int false_alarm = 0;
-    for (int i = 0; i < 5; i++) {                   // 10s，仍在 12s 宽限内
-        now += 2;
-        if (fl_fault_check(&s, 4000, 500, now, NULL)) false_alarm = 1;
-    }
-    ok(!false_alarm, "🔴[回归] 爬升宽限期(12s)内即使实际远低于目标也**不误报**");
-
-    // 宽限期过后持续跟不上 ⇒ 报
-    now += 20;                                      // 越过宽限
-    int onset = 0, fired = 0;
-    for (int i = 0; i < FL_FAULT_CYCLES + 2; i++) {
-        now += 2;
-        if (fl_fault_check(&s, 4000, 500, now, &onset)) fired = 1;
-    }
-    ok(fired, "⭐宽限期后持续低于 55% 达 6 周期 ⇒ 判定故障（判据是活的）");
-
-    // 边界：只差一个周期不得提前报
-    fl_fan_state_init(&s); now = 2000; s.settle_at = 0;
-    int early = 0;
-    for (int i = 0; i < FL_FAULT_CYCLES - 1; i++) {
-        now += 2;
-        if (fl_fault_check(&s, 4000, 500, now, NULL)) early = 1;
-    }
-    ok(!early, "边界：连续 5 周期（差 1 个）还不报");
-    now += 2;
-    ok(fl_fault_check(&s, 4000, 500, now, NULL), "边界：第 6 个周期才报");
-
-    // onset 只在首次判定时为 1（避免日志刷屏）
-    fl_fan_state_init(&s); now = 3000;
-    int onsets = 0;
-    for (int i = 0; i < 15; i++) {
-        now += 2; onset = 0;
-        fl_fault_check(&s, 4000, 500, now, &onset);
-        if (onset) onsets++;
-    }
-    ok(onsets == 1, "onset 只在**首次**判定时置 1（防日志刷屏），实际置位次数=1");
-
-    // 恢复后清除
-    for (int i = 0; i < 3; i++) { now += 2; fl_fault_check(&s, 4000, 3990, now, NULL); }
-    ok(!s.fault && s.cnt == 0, "恢复正常后故障态被清除");
-
-    // 不判的场景
-    fl_fan_state_init(&s);
-    ok(!fl_fault_check(&s, 500, 0, 100, NULL), "目标<1000 时不判（可能是固件在管）");
-    fl_fan_state_init(&s);
-    ok(!fl_fault_check(&s, 3000, -1, 100, NULL), "实际读取失败(-1) 时不判，不猜");
-
-    // fl_note_target 行为
-    fl_fan_state_init(&s);
-    ok(fl_note_target(&s, 2500, 500) == 1, "目标上调 >100 ⇒ 设置爬升宽限");
-    ok(fabs(s.settle_at - (500 + FL_SPINUP_GRACE)) < 0.001, "宽限截止 = now + 12s");
-    ok(fl_note_target(&s, 2550, 600) == 0, "目标小幅上调(50) ⇒ 不重置宽限");
-    ok(fl_note_target(&s, 2000, 700) == 0, "目标下调 ⇒ 不重置宽限");
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// 端到端（纯逻辑层面）：模拟一次完整升温→降温，验证整链行为
-static void test_integration(void){
-    group("整链集成（纯逻辑）：升温 → 降温 的完整轨迹");
-    fl_cfg c; fl_cfg_defaults(&c);
-    fl_cfg_clamp(&c);
-    fl_curve_rescale(&c, HW_MAX0);
-
-    double ema = -1, cur = c.min_rpm, last = -1;
-    double alpha = c.poll_interval / c.ema_seconds;
-    int writes = 0, overshoot = 0;
-    double peak = 0;
-
-    // 40°C → 80°C 各 60 周期，再降回
-    for (int phase = 0; phase < 2; phase++) {
-        double t = phase == 0 ? 80 : 40;
-        for (int i = 0; i < 60; i++) {
-            ema = fl_ema(ema, t, alpha);
-            int emg = t >= c.emergency_temp;
-            double want = emg ? 1e9 : fl_curve_eval(&c, ema);
-            double tgt = fl_clamp_fan(&c, HW_MIN, HW_MAX0, want, emg);
-            tgt = fl_slew(&c, cur, tgt, c.poll_interval, emg);
-            cur = tgt;
-            if (cur > peak) peak = cur;
-            if (fl_should_write(&c, last, tgt)) { last = tgt; writes++; }
-        }
-        // 升温段结束时应已接近曲线在 80°C 的值，且不得超过硬件上限
-        if (phase == 0) {
-            double expect = fl_curve_eval(&c, 80);
-            eqd(cur, expect, 60, "升温 80°C 稳定后目标 ≈ 曲线值");
-            if (cur > HW_MAX0 + 0.5) overshoot = 1;
-        }
-    }
-    ok(!overshoot, "⭐全程从不超过硬件上限（越界会被 SMC 拒绝）");
-    eqd(cur, c.min_rpm, 60, "降温回 40°C 后回落到下限附近");
-    ok(peak <= HW_MAX0 + 0.5, "峰值不超硬件上限");
-    printf("      120 周期共写 SMC %d 次（死区抑制生效，非每周期都写）\n", writes);
-    ok(writes < 120, "死区抑制：写入次数 < 周期数");
+    ok(writes <= 2 * 3 * (86400 / 1800 + 1), "被持续抢写 1 天：纠正写入 ≤ ~294 次，且不拉锯");
 }
 
 int main(void){
-    printf("═══ FanPilot 纯逻辑单元测试 ═══\n");
-    test_cfg_clamp();
-    test_curve_rescale();
-    test_fixed_mode();
-    test_temp_source();
-    test_curve_eval();
-    test_clamp_fan();
-    test_ema();
-    test_slew();
-    test_should_write();
-    test_fault();
-    test_integration();
-    printf("\n═══════════════════════════════\n");
-    printf("  通过 %d · 失败 %d\n", g_pass, g_fail);
-    if (g_fail == 0) { printf("  ✅ 全部通过\n"); return 0; }
-    printf("  ❌ 有失败\n");
-    return 1;
+    test_parse();
+    test_clamp();
+    test_target();
+    test_emergency();
+    test_rewrite();
+    test_storm_guards();
+    printf("\n═══════════════════════════════\n  通过 %d · 失败 %d\n", g_pass, g_fail);
+    if (g_fail == 0) printf("  ✅ 全部通过\n");
+    return g_fail == 0 ? 0 : 1;
 }

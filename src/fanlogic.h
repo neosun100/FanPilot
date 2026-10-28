@@ -1,302 +1,204 @@
 // fanlogic.h —— FanPilot 的**纯决策逻辑**（零 IOKit 依赖，可单元测试）
 //
-// 为什么单独拆出来：这些是真正会出错的地方（曲线插值、安全夹取、限幅、故障状态机），
-// 但它们原先和 IOKit 调用缠在一起，**只能靠跑真机观察，无法单元测试**。
-// 剥离后 tests/unit_logic.c 可以直接喂输入验输出，覆盖边界与回归。
+// 2.0 起 FanPilot 只做一件事：**把风扇定死在指定转速**。
+// 自适应曲线（EMA / 分段曲线 / 限幅 / 重铺 / 温度口径三档）整套删除 ——
+// 理由见 CHANGELOG 2.0.0：使用者只要定速，而 SMC 的 F*md=1 + F*Tg 是**锁存**的，
+// 定速只需「写一次」，曲线那套每 2 秒的计算全是无用功。
 //
-// 头文件内实现（static inline）：不引入额外编译单元，守护与测试都只 #include。
+// 这里留下的每个函数都是**真正会出错**的地方：配置解析（不可信输入）、
+// 安全夹取、紧急判定（带回差）、是否需要重写（外部改动检测）。
+// 头文件内实现（static inline）：守护与测试都只 #include，不引入额外编译单元。
 
 #ifndef FANLOGIC_H
 #define FANLOGIC_H
 
-#define FL_MAX_CURVE 12
-#define FL_NFAN      2
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define FL_NFAN 2
+
+// ── 所有阈值集中在这里（不散落成魔法数字）──────────────────────────
+#define FL_DEFAULT_PCT          50.0  // 默认定速：各风扇硬件上限的 50%
+#define FL_CHECK_MIN             5.0  // 巡检间隔下限：别把守护写成 CPU 大户
+#define FL_CHECK_MAX            60.0  // 上限：过热响应最坏延迟一个间隔，60s 已是极限
+#define FL_CHECK_DEFAULT        10.0
+#define FL_EMERG_MIN            70.0  // 不许低到天天误触发
+#define FL_EMERG_MAX            95.0  // ⭐ 不许把保护调没
+#define FL_EMERG_DEFAULT        90.0
+#define FL_EMERG_HYSTERESIS      5.0  // 降到 阈值-5°C 才解除，防止在阈值附近反复写 SMC
+#define FL_REWRITE_TOLERANCE     1.0  // F*Tg 回读与目标差超过此值才重写
+// 🩸 初版取 50：实测 SMC 回读 Tg 与写入值逐位一致（flt），50 毫无必要，
+//    反而让「改档 ≤50 RPM」被判成无需写入 —— e2e R15 抓到（3100→3150 不生效）。
+// ── 🔴 防写入风暴（使用者原话：「之前就是各种写入风暴，导致我的电脑死机」）──
+//    1.x 自适应模式 ≈ 2.3 万次/天写 SMC，与 2026-09-13~14 的 5 次 PMU 看门狗复位相关。
+//    定速稳态本就 0 写入；以下两道是**防 bug 与防抢写**的硬上限，不是常态路径。
+#define FL_WRITE_BURST          40.0  // 令牌桶容量：起步 4 次 + 连续改十几次档
+#define FL_WRITE_PER_HOUR      120.0  // 长期速率上限（2 次/分钟回补）⇒ 最坏 ≈2900 次/天
+// 🩸 初版 16 / 60：e2e 连续改档 10 次就把桶耗光，之后使用者改档要等几分钟才落地。
+//    防线是防「bug 无限写」，不是防「人连续点几下」—— 容量要盖住人的正常操作。
+#define FL_FIGHT_WINDOW        600.0  // 10 分钟内 …
+#define FL_FIGHT_COUNT           3    // … 被外部改动 ≥3 次 ⇒ 判定有别的程序在抢写
+#define FL_FIGHT_YIELD        1800.0  // ⇒ 让步 30 分钟（不纠正、不写），绝不互相拉锯
 
 // ── 配置 ──────────────────────────────────────────────────────────
 typedef struct {
-    double poll_interval;
-    double min_rpm;
-    double max_rpm;            // <=0 表示用硬件上限
-    double ema_seconds;
-    double slew_up, slew_down; // RPM/秒
-    double deadband;           // RPM
-    double emergency_temp;
-    int    temp_source;        // 曲线+显示口径：0=最热核(max) 1=全核平均(average) 2=最低核(min)
-    int    emergency_source;   // 紧急判据口径：同上取值，**独立于 temp_source**
-    int    curve_autoscale;    // 1 = 抬高下限时整条曲线跟着重新铺开（默认开）
-    // ── 转速模式 ──────────────────────────────────────────────
-    // 0 = curve（按温度自适应，原有行为）
-    // 1 = fixed（**定死转速**：写一次就不再写，除非被外力改动或触发紧急）
-    //
-    // 🩸 为什么要加这一档（2026-09-14）：本机两天内发生 5 次 PMU 硬件看门狗复位
-    //    （见 NewMac 的 m5-max-soc-watchdog-reboot.md）。唯一有长期无崩溃记录的配置，
-    //    是「把转速钉死、之后基本不再写 SMC」那种（Macs Fan Control 的用法）。
-    //    自适应模式下本守护约 **16 次/分 ≈ 2.3 万次/天** 写 SMC，
-    //    而定死模式稳态写入 **0 次** —— 这是目前唯一能解释「为什么崩溃间隔从
-    //    10 小时缩短到 1~2 小时」的单变量差异。
-    //    ⚠️ 相关 ≠ 因果，根因仍未确定。这一档是**降低暴露面**，不是已证明的修复。
-    int    fan_mode;
-    double fixed_rpm;          // fan_mode=1 时的目标转速
-    int    emergency_override;  // 1 = 定死模式下仍保留 90°C 紧急打满（默认开）
-    int    n_curve;
-    struct { double t, rpm; } curve[FL_MAX_CURVE];
+    // 定速 = **各风扇硬件上限的百分比**（使用者 2026-10-28 指定）。
+    // 为什么不用 RPM：两风扇上限不同（本机 5349 / 5777），同一个 RPM 对两者的风量占比不同；
+    // 一个百分比让两风扇「一样卖力」，也只需要记一个数。
+    double percent;
+    double check_interval;     // 安全巡检间隔（秒）
+    double emergency_temp;     // 紧急打满阈值
+    int    emergency_source;   // 紧急判据口径：0=最热核 1=全核平均 2=最低核
 } fl_cfg;
 
-#define FL_MODE_CURVE 0
-#define FL_MODE_FIXED 1
-
 static inline void fl_cfg_defaults(fl_cfg *c){
-    c->poll_interval = 2.0;
-    c->min_rpm       = 2000;
-    c->max_rpm       = 0;
-    c->ema_seconds   = 15.0;
-    c->slew_up       = 200;
-    c->slew_down     = 60;
-    c->deadband      = 50;
-    c->emergency_temp= 90;
-    c->temp_source     = 1;    // 曲线+显示：默认全核平均（使用者选定）
-    c->emergency_source= 1;    // 紧急判据：默认全核平均（使用者 2026-09-14 的明确决定）
-    c->curve_autoscale = 1;
-    c->fan_mode        = FL_MODE_CURVE;
-    c->fixed_rpm       = 3000;   // 与 Macs Fan Control 长期使用的值一致
-    c->emergency_override = 1;   // 定死模式也保留紧急打满：它只在真出事时才写 SMC
-    c->n_curve = 5;
-    c->curve[0].t=45; c->curve[0].rpm=2000;
-    c->curve[1].t=55; c->curve[1].rpm=2600;
-    c->curve[2].t=65; c->curve[2].rpm=3400;
-    c->curve[3].t=75; c->curve[3].rpm=4300;
-    c->curve[4].t=85; c->curve[4].rpm=5300;
+    c->percent          = FL_DEFAULT_PCT;
+    c->check_interval   = FL_CHECK_DEFAULT;
+    c->emergency_temp   = FL_EMERG_DEFAULT;
+    // 默认全核平均：使用者 2026-09-14 的明确决定（见 git 5dc2815）
+    c->emergency_source = 1;
 }
 
-// ── 安全夹取：配置是**不可信输入**（对用户可写，否则菜单栏 App 改不了）
-//
-// 🔴 保护性阈值的边界必须来自代码，不能来自可被降级的配置。
-//    实测踩过两个洞：max_rpm 设很低 ⇒ 紧急打满被挡；
-//                    emergency_temp 设 200 ⇒ 紧急保护被整个禁用。
+// 🔴 配置是**不可信输入**（对控制台用户可写，否则菜单栏 App 改不了）
+//    ⇒ 保护性阈值的边界来自代码，不来自配置。
 static inline void fl_cfg_clamp(fl_cfg *c){
-    if (c->poll_interval < 0.5) c->poll_interval = 0.5;   // 别把守护写成 CPU 大户
-    if (c->poll_interval > 30)  c->poll_interval = 30;    // 太慢来不及响应升温
-    if (c->ema_seconds < 1)     c->ema_seconds = 1;
-    if (c->ema_seconds > 120)   c->ema_seconds = 120;     // 平滑过久等于不响应
-    if (c->emergency_temp > 95) c->emergency_temp = 95;   // ⭐ 不许把保护调没
-    if (c->emergency_temp < 70) c->emergency_temp = 70;   // 也不许低到天天误触发
-    if (c->slew_up < 10)        c->slew_up = 10;          // 太小等于升不上去
-    if (c->deadband < 0)        c->deadband = 0;
-    if (c->deadband > 500)      c->deadband = 500;        // 太大等于不控制
-    // 转速模式：未知取值一律退回 curve（保守方向 —— 自适应至少不会把机器闷住）
-    if (c->fan_mode != FL_MODE_FIXED) c->fan_mode = FL_MODE_CURVE;
-    // fixed_rpm 只做**下限**保护：上限交给 fl_clamp_fan 按各风扇实测 F*Mx 夹。
-    // 🩸 这里不能写死 5349/5777 —— 两个风扇上限不同，且换机型就错（本项目原则：
-    //    上下限、风扇数、传感器全部运行时读取，绝不硬编码）。
-    if (c->fixed_rpm < 1000)    c->fixed_rpm = 1000;      // 低于此值形同不散热
-    if (c->fixed_rpm > 10000)   c->fixed_rpm = 10000;     // 荒谬值截断，实际由硬件上限决定
-    if (c->emergency_override != 0) c->emergency_override = 1;
+    // NaN 回默认（atof("nan") 是合法输入，且任何比较对 NaN 都为假）；越界夹到 0~100。
+    // 0% 不会让风扇停：目标最终还要夹到硬件下限 F*Mn（见 fl_fan_target）。
+    if (c->percent != c->percent) c->percent = FL_DEFAULT_PCT;
+    if (c->percent < 0)           c->percent = 0;
+    if (c->percent > 100)         c->percent = 100;
+    // NaN 落到下限：`!(x >= lo)` 对 NaN 为真
+    if (!(c->check_interval >= FL_CHECK_MIN)) c->check_interval = FL_CHECK_MIN;
+    if (c->check_interval > FL_CHECK_MAX)     c->check_interval = FL_CHECK_MAX;
+    if (!(c->emergency_temp >= FL_EMERG_MIN)) c->emergency_temp = FL_EMERG_MIN;
+    if (c->emergency_temp > FL_EMERG_MAX)     c->emergency_temp = FL_EMERG_MAX;
+    if (c->emergency_source < 0 || c->emergency_source > 2) c->emergency_source = 0;
 }
 
-// ── ⭐ 曲线自适应重铺（curve_autoscale）───────────────────────────
-//
-// 问题：只靠 fl_clamp_fan 夹底会把曲线**压平**。
-//   例：下限设 3000 时，默认曲线 45:2000 / 55:2600 / 65:3400
-//       ⇒ 45°C 与 55°C 都被夹到 3000，**45~65°C 成为死区，没有比例响应**。
-//
-// 正解：把配置里的曲线当作**形状模板**，把它的 RPM 跨度线性映射到 [min_rpm, hi]：
-//       rpm' = min_rpm + (rpm - curve_lo)/(curve_hi - curve_lo) * (hi - min_rpm)
-//   ⇒ 抬高下限后整条曲线跟着重新铺开，温度→转速的梯度保持存在。
-//
-// 例（下限 3000、上限取硬件 5349）：
-//   45°C 2000→3000 · 55°C 2600→3427 · 65°C 3400→3996 · 75°C 4300→4637 · 85°C 5300→5349
-//
-// ⚠️ 就地改写 cfg.curve，所以**只在配置加载后调用一次**，不可在主循环里反复调用
-//    （否则每次都以上一次的结果为输入，曲线会持续漂移 —— 这类「幂等性陷阱」
-//     本项目在 md=1 重复写那里已经栽过一次）。
-static inline void fl_curve_rescale(fl_cfg *c, double hw_max){
-    if (!c->curve_autoscale) return;      // 关掉时曲线原样使用（手工调过的不被改写）
-    if (c->n_curve <= 0) return;
-    double hi = hw_max;
-    if (c->max_rpm > 0 && c->max_rpm < hi) hi = c->max_rpm;
-    if (hi <= c->min_rpm) {                  // 上限不高于下限：整条压成常量下限
-        for (int i = 0; i < c->n_curve; i++) c->curve[i].rpm = c->min_rpm;
-        return;
-    }
-    double lo_src = c->curve[0].rpm, hi_src = c->curve[0].rpm;
-    for (int i = 1; i < c->n_curve; i++) {
-        if (c->curve[i].rpm < lo_src) lo_src = c->curve[i].rpm;
-        if (c->curve[i].rpm > hi_src) hi_src = c->curve[i].rpm;
-    }
-    double span_src = hi_src - lo_src;
-    if (span_src <= 0) {                     // 模板本身是平的：无形状可铺，全给下限
-        for (int i = 0; i < c->n_curve; i++) c->curve[i].rpm = c->min_rpm;
-        return;
-    }
-    double span_dst = hi - c->min_rpm;
-    for (int i = 0; i < c->n_curve; i++) {
-        double frac = (c->curve[i].rpm - lo_src) / span_src;
-        c->curve[i].rpm = c->min_rpm + frac * span_dst;
-    }
+// 口径名 → 枚举。无法识别时退回 0(最热核) —— 保守方向
+static inline int fl_parse_src(const char *v){
+    if (!strcmp(v,"average") || !strcmp(v,"avg") || !strcmp(v,"1")) return 1;
+    if (!strcmp(v,"min")     || !strcmp(v,"coolest") || !strcmp(v,"2")) return 2;
+    return 0;
+}
+static inline const char *fl_src_name(int s){ return s==1?"average":(s==2?"min":"max"); }
+
+// 解析一个数；不是数字（"abc"、空）返回 0 并保留原值 —— 不让垃圾值静默变成 0%
+static inline int fl_parse_num(const char *v, double *out){
+    char *end; double x = strtod(v, &end);
+    if (end == v) return 0;
+    while (*end == ' ' || *end == '\t' || *end == '%') end++;   // 允许写 "85%"
+    if (*end) return 0;
+    *out = x; return 1;
 }
 
-// ── 控制输入的选择 ────────────────────────────────────────────────
-//
-// temp_source: 0 = 最热核(max) · 1 = 全核平均(average)
-//
-// 🔴 **紧急保护路径永远用 max，不受此设置影响。**
-//    实测本机两个核簇温差巨大（性能核 72~84°C，能效核 59~62°C），
-//    5 个凉快的能效核把平均值拉低 **11.7°C**。
-//    ⇒ 若按平均判 90°C 紧急阈值，最热核到 ~102°C 时平均才刚到 90 —— 保护形同废设。
-//    这与本项目既有原则一致：保护性阈值的边界必须来自代码，不能来自可被降级的配置。
-// 按口径取值。三档：0=最热核 1=全核平均 2=最低核
+// 解析一行 `key = value  # 注释`。未知键忽略（旧版配置里的 curve/min_rpm 等不报错）。
+// 🩸 注释必须**先剥再解析**：旧版实测踩过「注释里的 kill -9 被吃成数字」。
+static inline void fl_cfg_parse_line(fl_cfg *c, const char *raw){
+    char line[512];
+    strncpy(line, raw, sizeof line - 1); line[sizeof line - 1] = 0;
+    char *h = strchr(line, '#'); if (h) *h = 0;
+    char k[64], v[400];
+    if (sscanf(line, " %63[^= \t] = %399[^\n]", k, v) != 2) return;
+    char *e = v + strlen(v);
+    while (e > v && (e[-1]==' ' || e[-1]=='\t' || e[-1]=='\r')) *--e = 0;
+    if      (!strcmp(k, "percent"))          fl_parse_num(v, &c->percent);
+    else if (!strcmp(k, "check_interval"))   c->check_interval   = atof(v);
+    else if (!strcmp(k, "emergency_temp"))   c->emergency_temp   = atof(v);
+    else if (!strcmp(k, "emergency_source")) c->emergency_source = fl_parse_src(v);
+}
+
+// 读整份配置：默认值 → 逐行覆盖 → 硬夹。文件不存在 = 全默认（返回 -1 供调用方留痕）。
+static inline int fl_cfg_load(const char *path, fl_cfg *c){
+    fl_cfg_defaults(c);
+    FILE *fp = fopen(path, "r");
+    int rc = -1;
+    if (fp) {
+        char line[512];
+        while (fgets(line, sizeof line, fp)) fl_cfg_parse_line(c, line);
+        fclose(fp);
+        rc = 0;
+    }
+    fl_cfg_clamp(c);
+    return rc;
+}
+
+// ── 每风扇实际写入的目标 ───────────────────────────────────────────
+// 百分比 × 该风扇运行时读到的上限，再夹在 [F*Mn, F*Mx] 内（风扇数、上下限全不硬编码）。
+// 紧急时直接给硬件上限。
+static inline double fl_fan_target(const fl_cfg *c, double fmin, double fmax, int emergency){
+    if (emergency) return fmax;
+    double t = (double)(long)(fmax * c->percent / 100.0 + 0.5);   // 取整到 1 RPM
+    if (t < fmin) t = fmin;
+    if (t > fmax) t = fmax;
+    return t;
+}
+
+// ── 紧急判定（带回差）────────────────────────────────────────────
 static inline double fl_pick_temp(int src, double hottest, double average, double coolest){
     if (src == 1) return average;
     if (src == 2) return coolest;
     return hottest;
 }
-// 曲线与菜单栏显示用的温度
-static inline double fl_control_temp(const fl_cfg *c,
-                                     double hottest, double average, double coolest){
-    return fl_pick_temp(c->temp_source, hottest, average, coolest);
-}
-// 紧急判定：与曲线**使用同一个口径**（由 temp_source 决定）。
-//
-// 📌 2026-09-14 使用者明确选择：紧急判据也改看平均值，阈值保持 90°C。
-//    我先用实测数据提过后果，使用者在知情后确认 ⇒ 按其决定实现。
-//
-// 后果（实测温差 2.0~7.8°C，高负载时曾达 11.7°C）：
-//    平均 90°C 触发时，最热核实际约 95~102°C。
-//    P 核约 100~105°C 开始重度降频。
-// ⚠️ 但这**不是唯一防线**：macOS/SoC 自身有硬件级过热保护（降频，极端时强制关机），
-//    本函数只是在其之上更早介入的一层优化。
-//
-// 想恢复"紧急看最热核"只需 temp_source = max（曲线也会一起变回最热核口径）。
-// 🔴 紧急判据用**独立口径** emergency_source，不跟随 temp_source。
-//
-// 为什么拆开（2026-09-14）：使用者要在菜单栏自由切换温度口径（含「最低核」）。
-//   实测最低核比最热核低**约 24°C**（Tp1g 58.2 vs Tp0C 82.2）
-//   ⇒ 若紧急判据也用最低核，最低核要到 90°C 意味着整机已彻底失控，
-//     这道保护不是被削弱，而是**等于关掉**。
-//   ⇒ 所以曲线口径（可玩）与紧急口径（保护）分成两个设置，
-//     并在菜单里**显示**紧急口径，不做隐藏行为。
-// 默认 emergency_source = average（沿用使用者上一个明确决定）。
-static inline int fl_is_emergency(const fl_cfg *c,
-                                  double hottest, double average, double coolest){
-    return fl_pick_temp(c->emergency_source, hottest, average, coolest) >= c->emergency_temp;
+// 进入：温度 ≥ 阈值；解除：温度 < 阈值 - 回差；之间保持上一状态。
+// 🩸 无回差时，温度在 90°C 上下抖 ⇒ 每次巡检都在「打满 ↔ 定速」之间切换并写 SMC。
+static inline int fl_emergency_next(const fl_cfg *c, int prev, double temp){
+    if (temp >= c->emergency_temp) return 1;
+    if (temp <  c->emergency_temp - FL_EMERG_HYSTERESIS) return 0;
+    return prev;
 }
 
-// ── 曲线：分段线性插值 ────────────────────────────────────────────
-static inline double fl_curve_eval(const fl_cfg *c, double t){
-    if (c->n_curve <= 0) return c->min_rpm;
-    if (t <= c->curve[0].t) return c->curve[0].rpm;
-    for (int i = 1; i < c->n_curve; i++) {
-        if (t <= c->curve[i].t) {
-            double t0=c->curve[i-1].t, r0=c->curve[i-1].rpm;
-            double t1=c->curve[i].t,   r1=c->curve[i].rpm;
-            if (t1 <= t0) return r1;
-            return r0 + (r1-r0) * (t-t0) / (t1-t0);
-        }
-    }
-    return c->curve[c->n_curve-1].rpm;
-}
-
-// ── 本周期的目标转速（未经夹取/限幅）─────────────────────────────
-//
-// 定死模式下**不看温度**：目标恒为 fixed_rpm ⇒ `fl_should_write` 的死区
-// 自然让稳态写入次数降到 **0**（不需要额外的"别写"分支，靠既有机制即可）。
-// ⭐ 这是刻意的：新增行为若能由既有机制自然导出，就不要再加一条特殊路径 ——
-//    特殊路径是后续分叉的种子。
-static inline double fl_target_rpm(const fl_cfg *c, double smoothed_temp){
-    if (c->fan_mode == FL_MODE_FIXED) return c->fixed_rpm;
-    return fl_curve_eval(c, smoothed_temp);
-}
-
-// 定死模式下紧急保护是否生效。
-// 🔴 默认生效：它在正常温度下**一次都不写 SMC**，只在真的超阈值时才动，
-//    所以"降低写入暴露面"与"保留过热保护"并不冲突 —— 没有理由为了前者放弃后者。
-static inline int fl_emergency_active(const fl_cfg *c){
-    if (c->fan_mode == FL_MODE_FIXED) return c->emergency_override != 0;
-    return 1;                                  // 曲线模式永远保留
-}
-
-// ── 夹到该风扇的合法区间。emergency=1 时**忽略用户 max_rpm**，只受硬件上限约束
-static inline double fl_clamp_fan(const fl_cfg *c, double fmin, double fmax,
-                                  double rpm, int emergency){
-    double lo = c->min_rpm > fmin ? c->min_rpm : fmin;
-    double hi = fmax;
-    if (!emergency && c->max_rpm > 0 && c->max_rpm < hi) hi = c->max_rpm;
-    if (hi < lo) hi = lo;
-    if (rpm < lo) rpm = lo;
-    if (rpm > hi) rpm = hi;
-    return rpm;
-}
-
-// ── EMA 平滑。prev < 0 表示尚未初始化（首次直接取原值，避免从 0 慢慢爬）
-static inline double fl_ema(double prev, double raw, double alpha){
-    if (prev < 0) return raw;
-    if (alpha > 1) alpha = 1;
-    if (alpha < 0) alpha = 0;
-    return alpha * raw + (1 - alpha) * prev;
-}
-
-// ── 变化率限幅（非对称：升快降慢）。emergency 时不限幅
-static inline double fl_slew(const fl_cfg *c, double cur, double target,
-                             double dt, int emergency){
-    if (emergency) return target;
-    double up = c->slew_up * dt, down = c->slew_down * dt;
-    double d = target - cur;
-    if (d >  up)   return cur + up;
-    if (d < -down) return cur - down;
-    return target;
-}
-
-// ── 死区：变化小于 deadband 就不写 SMC（写是唯一危险操作，能少写就少写）
-static inline int fl_should_write(const fl_cfg *c, double last_written, double target){
-    if (last_written < 0) return 1;
-    double d = target - last_written;
+// ── 是否需要（重）写 SMC ──────────────────────────────────────────
+// 定速的全部意义是「写一次就不再动」⇒ 只在回读与目标不符时才写：
+//   · md != 1  ⇒ 被交还了固件（别的程序 / 睡眠交接后 / SMC 复位）
+//   · Tg 偏离  ⇒ 被别的程序改了目标
+// 读失败（md_now < 0）按「需要写」处理：宁可多写一次，也不让风扇脱管。
+static inline int fl_needs_rewrite(int md_now, double tg_now, double target){
+    if (md_now != 1) return 1;
+    double d = tg_now - target;
     if (d < 0) d = -d;
-    return d > c->deadband;
+    return d > FL_REWRITE_TOLERANCE;
 }
 
-// ── 风扇故障状态机 ────────────────────────────────────────────────
-//
-// 只有守护有**历史**，才能区分「刚提速还没跟上」（正常，实测爬升 6~9s）
-// 和「持续跟不上」（故障）。显示层只有瞬时值，判不了这件事。
-#define FL_FAULT_RATIO   0.55   // 实际低于目标的这个比例算异常
-#define FL_FAULT_CYCLES  6      // 连续这么多周期才判故障（2s 轮询 ⇒ 12s）
-#define FL_SPINUP_GRACE  12.0   // 目标上调后的爬升宽限秒数
+// ── 写入令牌桶 ────────────────────────────────────────────────────
+// 每次 SMC 写入取 1 枚；按 FL_WRITE_PER_HOUR 匀速回补，最多存 FL_WRITE_BURST 枚。
+// 取不到 ⇒ 本次**不写**（调用方留痕）。时间用「醒着时钟」，睡眠不回补也不消耗。
+typedef struct { double tokens, last; } fl_bucket;
 
-typedef struct {
-    int    fault;
-    int    cnt;
-    double settle_at;    // 爬升宽限截止时刻
-    double prev_target;
-} fl_fan_state;
-
-static inline void fl_fan_state_init(fl_fan_state *s){
-    s->fault = 0; s->cnt = 0; s->settle_at = 0; s->prev_target = 0;
-}
-
-// 目标上调超过 100 RPM 就给爬升宽限。返回是否重置了宽限。
-static inline int fl_note_target(fl_fan_state *s, double target, double now){
-    int bumped = (target > s->prev_target + 100);
-    if (bumped) s->settle_at = now + FL_SPINUP_GRACE;
-    s->prev_target = target;
-    return bumped;
-}
-
-// 返回 1 = 故障态。onset 非 NULL 时 *onset=1 表示本次**刚刚**判定为故障（用于打日志）
-static inline int fl_fault_check(fl_fan_state *s, double target, double actual,
-                                 double now, int *onset){
-    if (onset) *onset = 0;
-    if (target < 1000 || actual < 0) { s->cnt = 0; s->fault = 0; return 0; }
-    if (now < s->settle_at) return s->fault;          // 爬升宽限期内不判
-    if (actual < target * FL_FAULT_RATIO) {
-        if (s->cnt < 100000) s->cnt++;
-        if (s->cnt >= FL_FAULT_CYCLES && !s->fault) {
-            s->fault = 1;
-            if (onset) *onset = 1;
-        }
-    } else {
-        s->cnt = 0; s->fault = 0;
+static inline void fl_bucket_init(fl_bucket *b, double now){ b->tokens = FL_WRITE_BURST; b->last = now; }
+static inline int fl_bucket_take(fl_bucket *b, double now, int n){
+    double dt = now - b->last;
+    if (dt > 0) {
+        b->tokens += dt * FL_WRITE_PER_HOUR / 3600.0;
+        if (b->tokens > FL_WRITE_BURST) b->tokens = FL_WRITE_BURST;
     }
-    return s->fault;
+    b->last = now;
+    if (b->tokens < n) return 0;
+    b->tokens -= n;
+    return 1;
 }
 
-#endif // FANLOGIC_H
+// ── 抢写检测 ──────────────────────────────────────────────────────
+// 🩸 2026-09-14 事故形态：两个程序各自「纠正」对方，目标值在 3300 ↔ 2500 来回跳，
+//    双方都不报错。⇒ 发现被反复改写时，FanPilot **让步**而不是加大力度。
+typedef struct { double at[FL_FIGHT_COUNT]; int n; double yield_until; } fl_fight;
+
+static inline void fl_fight_init(fl_fight *g){ memset(g, 0, sizeof *g); }
+static inline int  fl_fight_yielding(const fl_fight *g, double now){ return now < g->yield_until; }
+// 记一次外部改动；返回 1 = 刚刚进入让步
+static inline int fl_fight_note(fl_fight *g, double now){
+    // 滑动窗口：丢掉窗口外的旧记录
+    int k = 0;
+    for (int i = 0; i < g->n; i++) if (now - g->at[i] < FL_FIGHT_WINDOW) g->at[k++] = g->at[i];
+    g->n = k;
+    if (g->n < FL_FIGHT_COUNT) g->at[g->n++] = now;
+    if (g->n >= FL_FIGHT_COUNT) {
+        g->n = 0;
+        g->yield_until = now + FL_FIGHT_YIELD;
+        return 1;
+    }
+    return 0;
+}
+
+#endif
