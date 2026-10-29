@@ -27,6 +27,9 @@
 #define FL_EMERG_MAX            95.0  // ⭐ 不许把保护调没
 #define FL_EMERG_DEFAULT        90.0
 #define FL_EMERG_HYSTERESIS      5.0  // 降到 阈值-5°C 才解除，防止在阈值附近反复写 SMC
+#define FL_EMERG_MIN_HOLD       60.0  // 打满后至少保持 60 s 才允许解除 ⇒ 最多每分钟进出一次
+// 🩸 2026-10-29 使用者：「写 SMC 不要太频繁，否则可能有问题」。只靠回差的话，负载忽高忽低时全核平均
+//    在 84~91°C 间来回摆，可以每次巡检都进出一次（每 10 s 4 次写入）。解除虽已受令牌桶约束，但进入不受，实测最坏仍有单风扇 5791 次/天。
 #define FL_REWRITE_TOLERANCE     1.0  // F*Tg 回读与目标差超过此值才重写
 // 🩸 初版取 50：实测 SMC 回读 Tg 与写入值逐位一致（flt），50 毫无必要，
 //    反而让「改档 ≤50 RPM」被判成无需写入 —— e2e R15 抓到（3100→3150 不生效）。
@@ -149,6 +152,15 @@ static inline int fl_emergency_next(const fl_cfg *c, int prev, double temp){
     return prev;
 }
 
+// 带最短保持时间的紧急判定：进入立即生效（过热保护不能等）；解除要满足回差**且**已保持 ≥ FL_EMERG_MIN_HOLD。
+// since = 进入紧急的时刻（醒着时钟），由本函数维护。
+static inline int fl_emergency_step(const fl_cfg *c, int prev, double temp, double now, double *since){
+    int next = fl_emergency_next(c, prev, temp);
+    if (!prev && next) { *since = now; return 1; }
+    if (prev && !next && now - *since < FL_EMERG_MIN_HOLD) return 1;
+    return next;
+}
+
 // ── 是否需要（重）写 SMC ──────────────────────────────────────────
 // 定速的全部意义是「写一次就不再动」⇒ 只在回读与目标不符时才写：
 //   · md != 1  ⇒ 被交还了固件（别的程序 / 睡眠交接后 / SMC 复位）
@@ -158,6 +170,19 @@ static inline int fl_needs_rewrite(int md_now, double tg_now, double target){
     if (md_now != 1) return 1;
     double d = tg_now - target;
     if (d < 0) d = -d;
+    return d > FL_REWRITE_TOLERANCE;
+}
+
+// ── 回读不一致时：是「别人改了」还是「我自己要改」？──────────────────
+// 🩸 2026-10-29 实测：每次紧急打满 → 解除，守护都会让步 30 分钟、把风扇**卡在最高速**。
+//    根因：拿 SMC 回读去和**新目标**比 —— 紧急进入时 Tg(3209) ≠ 新目标(5349)、解除时 Tg(5349) ≠ 3209，
+//    都被记成「外部改动」，一进一出凑满 3 次 ⇒ 判定有人抢写 ⇒ 让步，停在自己刚写的上限上。
+// 正解：拿回读和**我上次写进去的值**比。不一样才说明有人动过；只是目标变了（紧急 / 改档）是我自己的事。
+//   last_written < 0 = 还没写过（刚启动 / 刚交还过固件）⇒ 无从判断，不算外部改动。
+static inline int fl_is_external_change(int md_now, double tg_now, double last_written){
+    if (last_written < 0) return 0;
+    if (md_now != 1) return 1;                        // 我上次写的是手动，现在不是 ⇒ 有人交还了
+    double d = tg_now - last_written; if (d < 0) d = -d;
     return d > FL_REWRITE_TOLERANCE;
 }
 

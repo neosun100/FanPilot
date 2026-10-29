@@ -190,6 +190,70 @@ static void test_storm_guards(void){
     ok(writes <= 2 * 3 * (86400 / 1800 + 1), "被持续抢写 1 天：纠正写入 ≤ ~294 次，且不拉锯");
 }
 
+static void test_self_vs_external(void){
+    group("🔴 自己改目标 ≠ 别人改了 —— 紧急打满不得触发让步（2026-10-29 实测卡在最高速 30 分钟）");
+    // 紧急进入：SMC 里是我上次写的 3209，新目标 5349
+    ok(fl_needs_rewrite(1, 3209, 5349) == 1, "紧急进入：需要写");
+    ok(fl_is_external_change(1, 3209, 3209) == 0, "[回归] 紧急进入：回读 = 我上次写的 ⇒ 不是外部改动");
+    // 紧急解除：SMC 里是我上次写的 5349，新目标 3209
+    ok(fl_is_external_change(1, 5349, 5349) == 0, "[回归] 紧急解除：回读 = 我上次写的 ⇒ 不是外部改动");
+    // 改档：同理
+    ok(fl_is_external_change(1, 4814, 4814) == 0, "改档：回读 = 我上次写的 ⇒ 不是外部改动");
+    // 真被别人改了
+    ok(fl_is_external_change(1, 2222, 3209) == 1, "回读 2222 ≠ 我写的 3209 ⇒ 外部改动");
+    ok(fl_is_external_change(0, 3209, 3209) == 1, "md 被改成 0 ⇒ 外部改动（有人交还了固件）");
+    ok(fl_is_external_change(1, 1350, -1) == 0, "还没写过（刚启动 / 刚交还）⇒ 不算外部改动");
+    // 端到端模拟：温度在阈值附近进出紧急 10 次，让步次数必须为 0
+    fl_cfg c = parsed("percent = 60\nemergency_temp = 90\n");
+    fl_fight g; fl_fight_init(&g);
+    double tg = -1, last = -1; int md = 0, em = 0, yields = 0;
+    for (int i = 0; i < 20; i++) {
+        double t = (i % 2) ? 95 : 80;                 // 进出紧急各 10 次
+        em = fl_emergency_next(&c, em, t);
+        double target = fl_fan_target(&c, HW_MIN, HW_MAX0, em);
+        if (fl_needs_rewrite(md, tg, target)) {
+            if (fl_is_external_change(md, tg, last) && fl_fight_note(&g, i * 5.0)) yields++;
+            md = 1; tg = target; last = target;
+        }
+    }
+    ok(yields == 0, "[回归] 进出紧急 10 次（全程无外部程序）⇒ 让步 0 次（修复前：第一次解除就让步）");
+}
+
+static void test_emergency_write_bound(void){
+    group("🔴 过热路径的 SMC 写入有硬上限（使用者：写 SMC 不要太频繁）");
+    fl_cfg c = parsed("percent = 60\nemergency_temp = 90\n");
+    double since = 0;
+    ok(fl_emergency_step(&c, 0, 91, 0, &since) == 1, "过热 → 立即打满（不等）");
+    ok(fl_emergency_step(&c, 1, 80, 30, &since) == 1, "打满 30 s 后已降到 80°C → 仍保持（不足 60 s）");
+    ok(fl_emergency_step(&c, 1, 80, 60, &since) == 0, "打满满 60 s 且已降到 80°C → 解除");
+    ok(fl_emergency_step(&c, 1, 88, 120, &since) == 1, "满 60 s 但只降到 88°C（回差内）→ 仍保持");
+
+    // 最坏情况模拟：全核平均每次巡检都在 80 / 95°C 之间来回摆，持续 1 天（5 s 巡检）
+    fl_bucket b; fl_bucket_init(&b, 0);
+    int em = 0, md = 1, writes = 0; double tg = fl_fan_target(&c, HW_MIN, HW_MAX0, 0); since = 0;
+    for (int t = 0; t < 86400; t += 5) {
+        double temp = ((t / 5) % 2) ? 95 : 80;
+        em = fl_emergency_step(&c, em, temp, t, &since);
+        double target = fl_fan_target(&c, HW_MIN, HW_MAX0, em);
+        if (fl_needs_rewrite(md, tg, target)) {
+            int allowed = fl_bucket_take(&b, t, 1);     // 守护里：解除受额度约束；进入照写，额度够就扣
+            if (em || allowed) { tg = target; writes++; }
+        }
+    }
+    printf("     （1 天最坏情况：单个风扇写入 %d 次）\n", writes);
+    ok(writes <= 2 * 86400 / (int)FL_EMERG_MIN_HOLD, "温度每 5 s 来回摆一整天：单风扇写入 ≤ 2880 次（实测 2469；去掉 60 s 保持时实测 5791）");
+
+    // 使用者设的就是 100%：打满的目标 = 定速目标 ⇒ 进出过热都不需要写
+    fl_cfg full = parsed("percent = 100\n");
+    em = 0; md = 1; tg = fl_fan_target(&full, HW_MIN, HW_MAX0, 0); writes = 0; since = 0;
+    for (int t = 0; t < 3600; t += 5) {
+        em = fl_emergency_step(&full, em, ((t / 5) % 2) ? 95 : 80, t, &since);
+        double target = fl_fan_target(&full, HW_MIN, HW_MAX0, em);
+        if (fl_needs_rewrite(md, tg, target)) { tg = target; writes++; }
+    }
+    ok(writes == 0, "⭐设成 100% 时，进出过热 1 小时（360 次）写 SMC 0 次（打满目标 = 定速目标）");
+}
+
 static void test_core_temp_key(void){
     group("fl_is_core_temp_key —— 什么算核心温度（守护与 fanctl 共用）");
     ok(fl_is_core_temp_key("Tp00", "flt ", 4, 65.0), "Tp00 flt 4B 65°C → 是");
@@ -219,6 +283,8 @@ int main(void){
     test_storm_guards();
     test_darkwake();
     test_core_temp_key();
+    test_self_vs_external();
+    test_emergency_write_bound();
     printf("\n═══════════════════════════════\n  通过 %d · 失败 %d\n", g_pass, g_fail);
     if (g_fail == 0) printf("  ✅ 全部通过\n");
     return g_fail == 0 ? 0 : 1;

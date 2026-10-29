@@ -161,9 +161,11 @@ static Key    g_temp[MAX_SENSORS]; static int g_ntemp = 0;   // Tp* 簇
 static Key    g_md[NFAN], g_tg[NFAN], g_ac[NFAN];
 static double g_fmin[NFAN], g_fmax[NFAN];                    // 运行时读到的硬件上下限
 static long   g_writes = 0;
+static double g_last_tg[NFAN] = {-1, -1};   // 我上次写进 F*Tg 的值（-1 = 没写过 / 已交还）—— 判「外部改动」的唯一依据
 static time_t g_last_write = 0;    // 最近一次 SMC 写入的墙钟时间（0 = 从未）—— 让「累计 N 次」可被验证
 static long   g_external = 0;      // 被外部改动并纠正的次数（> 0 说明有别的程序在抢）
 static int    g_emergency = 0;
+static double g_em_since = 0;      // 进入紧急的时刻（醒着时钟）—— 打满后至少保持 FL_EMERG_MIN_HOLD
 static int    g_failsafe = 0;
 static int    g_starved = 0;       // 写入预算耗尽中（边沿留痕用）
 static fl_bucket g_bucket;
@@ -222,6 +224,7 @@ static int read_temps(double *hottest, double *average, double *coolest){
 // （不受令牌桶限制：这是安全方向的写入，且只在边沿发生）
 static void fans_to_firmware(void){
     for (int f = 0; f < NFAN; f++) {
+        g_last_tg[f] = -1;          // 交还后回读 md=0 是预期，不得算成外部改动
         // 已经是固件控制就不写：DarkWake 结束重新睡眠时也会走到这里，每次白写 2 次（约每小时一次）
         int md = -1;
         if (key_read_u8(&g_md[f], &md) == 0 && md == 0) continue;
@@ -275,8 +278,8 @@ static void write_status(const char *mode, double hot, double avg, double cool,
 //
 // 启动、唤醒、配置变化、定时巡检**全走这一个函数**（单一来源，不会分叉）。
 // 它是幂等的：回读一致就什么都不写。
-static void check_once(const char *why_in){
-    const char *why = why_in;
+// 不再区分「为什么来巡检」：是不是外部改动只看回读与我上次写的值（fl_is_external_change），与场景无关
+static void check_once(void){
     double z[NFAN] = {0, 0};
     if (g_sleeping) {
         // 🩸 两个事实都成立才接管：
@@ -291,7 +294,6 @@ static void check_once(const char *why_in){
         if (caps < 0) logmsg("⚠️ 读不到系统能力（IOPMrootDomain \"System Capabilities\"）—— 无法区分 DarkWake，按完全唤醒接管\n");
         else          logmsg("完全唤醒（系统能力 0x%lx）→ 重新接管风扇\n", caps);
         g_sleeping = 0;
-        why = "唤醒";
     }
 
     double hot, avg, cool;
@@ -306,11 +308,12 @@ static void check_once(const char *why_in){
         write_status("failsafe_sensor_read_failed", -1, -1, -1, z, z);
         return;
     }
-    if (g_failsafe) { logmsg( "传感器恢复 → 重新接管\n"); why = "恢复"; }
+    if (g_failsafe) { logmsg( "传感器恢复 → 重新接管\n"); }
     g_failsafe = 0;
 
-    int em = fl_emergency_next(&g_cfg, g_emergency,
-                               fl_pick_temp(g_cfg.emergency_source, hot, avg, cool));
+    int em = fl_emergency_step(&g_cfg, g_emergency,
+                               fl_pick_temp(g_cfg.emergency_source, hot, avg, cool),
+                               awake_now(), &g_em_since);
     if (em != g_emergency)          // 边沿触发留痕，不按巡检刷屏
         logmsg( em ? "🔥 %s温度 %.1f°C ≥ %.0f°C → 紧急打满\n"
                            : "紧急解除（%s温度 %.1f°C < %.0f°C-5）→ 回到定速\n",
@@ -328,8 +331,9 @@ static void check_once(const char *why_in){
         if (key_read_u8(&g_md[f], &md) != 0) md = -1;
         if (key_read_flt(&g_tg[f], &tg_now) != 0) tg_now = -1;
         if (!yielding && fl_needs_rewrite(md, tg_now, target)) {
-            // 定时巡检里发现不符 = 有别的东西改了寄存器（别的风扇软件 / SMC 复位）
-            if (!strcmp(why, "巡检")) {
+            // 回读 ≠ 我上次写的 ⇒ 有别的东西改了寄存器（别的风扇软件 / SMC 复位）。
+            // 🩸 不能用「回读 ≠ 新目标」：紧急进出、改档时新目标本来就变了，那是我自己要改（见 fl_is_external_change）
+            if (fl_is_external_change(md, tg_now, g_last_tg[f])) {
                 g_external++;
                 logmsg( "⚠️ 风扇%d 被外部改动（md=%d Tg=%.0f，累计 %ld 次）\n",
                         f, md, tg_now, g_external);
@@ -341,9 +345,12 @@ static void check_once(const char *why_in){
                     continue;
                 }
             }
-            // 🔴 写入令牌桶：防 bug 导致的写入风暴。紧急打满不受限（它自身被回差限频）
+            // 🔴 写入令牌桶：防 bug 导致的写入风暴。
+            //    进入打满：照写（过热保护不能等），但额度够就扣 —— 频繁进出会耗尽额度，从而推迟后续的解除
+            //    解除 / 改档 / 纠正：必须拿到额度，拿不到就保持现状（打满时 = 继续最高速，安全方向）
             int n = (md != 1) + 1;
-            if (!em && !fl_bucket_take(&g_bucket, now, n)) {
+            int got = fl_bucket_take(&g_bucket, now, n);
+            if (!em && !got) {
                 if (!g_starved) logmsg( "🛑 SMC 写入预算耗尽（>%.0f 次/小时）—— 暂停写入，"
                                                 "这说明有 bug 或外部抢写，请看上面的日志\n",
                                         FL_WRITE_PER_HOUR);
@@ -351,7 +358,7 @@ static void check_once(const char *why_in){
             } else {
                 // 先 md=1 再写 Tg：顺序反了会有「已切手动但目标是旧值/0」的窗口
                 if (md != 1 && key_write_u8(&g_md[f], 1) == 0) g_writes++;
-                if (key_write_flt(&g_tg[f], target) == 0) g_writes++;
+                if (key_write_flt(&g_tg[f], target) == 0) { g_writes++; g_last_tg[f] = target; }
                 g_last_write = time(NULL);
             }
         }
@@ -418,7 +425,7 @@ static void pm_apply(natural_t type){
             g_woke = 1;
             long caps = system_caps();
             if (fl_should_take_over(caps)) {
-                check_once("唤醒");     // 由 check_once 的睡眠闸门统一判定与留痕（单一来源）
+                check_once();     // 由 check_once 的睡眠闸门统一判定与留痕（单一来源）
             } else {
                 logmsg("DarkWake（系统能力 0x%lx，无显示）→ 不接管，风扇继续归固件\n", caps);
             }
@@ -613,7 +620,7 @@ int main(int argc, char **argv){
 
     fl_bucket_init(&g_bucket, awake_now());
     fl_fight_init(&g_fight);
-    check_once("启动");
+    check_once();
     double last = awake_now();
     while (!oneshot && !g_stop) {
         // 只有两种唤醒：巡检到期，或事件（信号 / 配置 / 电源）调了 CFRunLoopStop。
@@ -637,7 +644,7 @@ int main(int argc, char **argv){
             if (cfg_changed() || g_hup) {
                 g_hup = 0; reload_config();
                 fl_fight_init(&g_fight);    // 使用者显式改了设置 = 明确要 FanPilot 接管，结束让步
-                check_once("配置变化"); last = awake_now();
+                check_once(); last = awake_now();
             }
         }
         if (awake_now() - last >= g_cfg.check_interval) {
@@ -646,9 +653,9 @@ int main(int argc, char **argv){
             // 🩸 原地编辑触发的写入必须记为「配置变化」而不是「巡检发现外部改动」——
             //    初版走了巡检分支，使用者自己改配置被算成抢写，3 次就会错误让步 30 分钟
             if (cfg_changed()) {
-                reload_config(); fl_fight_init(&g_fight); check_once("配置变化");
+                reload_config(); fl_fight_init(&g_fight); check_once();
             } else {
-                check_once("巡检");
+                check_once();
             }
             last = awake_now();
         }
