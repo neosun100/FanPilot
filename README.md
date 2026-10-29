@@ -13,8 +13,8 @@
   <a href="https://github.com/neosun100/FanPilot/releases/latest"><img alt="release" src="https://img.shields.io/github/v/release/neosun100/FanPilot?style=flat-square&color=0F4C75"/></a>
   <img alt="platform" src="https://img.shields.io/badge/macOS-13%2B%20·%20Apple%20Silicon-0F4C75?style=flat-square&logo=apple&logoColor=white"/>
   <img alt="lang" src="https://img.shields.io/badge/C%20%2B%20Swift-零依赖-3AAFA9?style=flat-square"/>
-  <img alt="tests" src="https://img.shields.io/badge/tests-177%20passing-3AAFA9?style=flat-square"/>
-  <img alt="mutations" src="https://img.shields.io/badge/mutations-10%2F10%20killed-3AAFA9?style=flat-square"/>
+  <img alt="tests" src="https://img.shields.io/badge/tests-198%20passing-3AAFA9?style=flat-square"/>
+  <img alt="mutations" src="https://img.shields.io/badge/mutations-14%2F14%20killed-3AAFA9?style=flat-square"/>
   <img alt="smc writes" src="https://img.shields.io/badge/稳态写%20SMC-0%20次-2E7D32?style=flat-square"/>
   <a href="LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square"/></a>
 </p>
@@ -308,7 +308,7 @@ SMC 的 `F*md=1`（手动）与 `F*Tg`（目标）是**锁存**寄存器 —— 
 | `mode` | 含义 | 怎么回到定速 |
 |---|---|---|
 | `normal` | 定速运行 | — |
-| `emergency` | 紧急判据温度 ≥ 阈值，两风扇打满 | 降到阈值 − 5 °C 以下（回差，防止在阈值附近来回切） |
+| `emergency` | 紧急判据温度 ≥ 阈值，两风扇打满 | 降到阈值 − 5 °C 以下（回差）**且**已打满 ≥ 60 s —— 两条都是为了不频繁写 SMC |
 | `yielded_external_writer` | 10 分钟内被外部改动 3 次 ⇒ 让步 | 30 分钟后自动；或你在菜单里改一次档 |
 | `write_budget_exhausted` | 写入超出令牌桶（防 bug 的保险丝） | 自动回补（2 次/分钟） |
 | `failsafe_sensor_read_failed` | 读不到温度 ⇒ 已交还固件 | 传感器恢复后自动 |
@@ -323,7 +323,8 @@ SMC 的 `F*md=1`（手动）与 `F*Tg`（目标）是**锁存**寄存器 —— 
 |---|---|---|
 | 写入令牌桶 | 突发 ≤ 40 次，长期 ≤ 120 次/小时，超出停写并留痕 | 每秒都想写、持续 1 小时 ⇒ 放行 ≤ 121 次 |
 | 抢写让步 | 10 分钟内被外部改动 ≥ 3 次 ⇒ 让步 30 分钟 | 被持续抢写 1 天 ⇒ 纠正写入 ≤ 294 次，且不拉锯 |
-| 紧急回差 | 进入 ≥ 阈值，解除 < 阈值 − 5 °C | 温度在 89/91 °C 抖 20 次 ⇒ 只切换 1 次 |
+| 紧急回差 + 最短保持 | 进入 ≥ 阈值立即打满；解除要 < 阈值 − 5 °C **且**已保持 ≥ 60 s | 温度每 5 s 在 80/95 °C 间摆一整天 ⇒ 单风扇 2469 次（去掉保持时间 5791 次）；设成 100 % 时 0 次 |
+| 自己改目标 ≠ 别人改 | 「外部改动」只看回读与**我上次写的值**是否一致 | 进出紧急 10 次 ⇒ 让步 0 次（2.1.2 及以前：每次过热后卡在最高速 30 分钟） |
 | 重载只认配置身份 | 目录事件只在配置文件 inode/size/mtime 变化时才重载 | 往配置目录造 100 次无关事件 ⇒ 重载 0 次（开发中曾实测 23 秒 4074 次） |
 | 重启节流 | launchd `ThrottleInterval = 10` | 启动持续失败时不会每秒重扫 3669 个 SMC 键（1.x 是每秒一次） |
 | 单实例 | 守护 `flock`；App 后来者自动退出 | 再起一个实例 ⇒ 被拒 / 自动退出 |
@@ -382,14 +383,14 @@ grep writes_total /var/run/fanpilot.status.json; sleep 60; grep writes_total /va
 ## 测试
 
 ```bash
-make test     # 单元 72 + 验收 31 + E2E/回归 74 = 177 项
+make test     # 单元 86 + 验收 31 + E2E/回归 81 = 198 项
 ```
 
 | 层 | 守什么 | 守不住什么 |
 |---|---|---|
-| `tests/unit_logic.c` · **72** | `fanlogic.h` 全部纯逻辑：配置解析（含 NaN / 垃圾值 / 注释）、硬夹、百分比折算、紧急回差、令牌桶、抢写让步 | IOKit 交互 |
+| `tests/unit_logic.c` · **86** | `fanlogic.h` 全部纯逻辑：配置解析（含 NaN / 垃圾值 / 注释）、硬夹、百分比折算、紧急回差、令牌桶、抢写让步 | IOKit 交互 |
 | `install/verify.sh` · **31** | 装好后的事实：运行状态、失效安全、**稳态 60 秒 0 写入**、资源预算、重启节流、反向断言 | 用户路径 |
-| `tests/e2e.sh` · **74** | 真机用户路径 + 按真实 bug 编号的回归，含活体：改档即刻生效、目录噪音不触发重载、原地编辑 ≤ 1 周期生效、被抢写时让步、App 单实例 | 真实合盖（见路线图） |
+| `tests/e2e.sh` · **81** | 真机用户路径 + 按真实 bug 编号的回归，含活体：改档即刻生效、目录噪音不触发重载、原地编辑 ≤ 1 周期生效、被抢写时让步、App 单实例 | 真实合盖（见路线图） |
 
 关键判据都做过**变异验证**：把修过的缺陷改回去（容差 50、桶容量 16、去掉回差、永远重写、去 NaN 防护、紧急不打满、让步失效、不剥注释），
 测试必须变红 —— **8/8 变红**；另有 2 条接线级变异：去掉「重挂文件监听」⇒ R19 红，DarkWake 改回「无条件接管」⇒ `--selftest-pm` fail。
