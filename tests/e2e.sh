@@ -274,7 +274,7 @@ n2="$(grep -c 'func menuWillOpen' "${ROOT}/app/Sources/FanPilotMenu/main.swift" 
 [ "${n2}" != "0" ] && ok "实现 menuWillOpen（打开瞬间先刷一次）" || bad "缺 menuWillOpen"
 
 grp "回归 R10 —— 逻辑在两处重复（守护与 fanlogic.h 分叉）"
-for fn in fl_cfg_load fl_fan_target fl_emergency_next fl_needs_rewrite fl_bucket_take fl_fight_note; do
+for fn in fl_cfg_load fl_fan_target fl_emergency_step fl_needs_rewrite fl_is_external_change fl_bucket_take fl_fight_note fl_should_take_over fl_is_core_temp_key; do
   n="$(grep -c "${fn}" "${ROOT}/src/fanpilotd.c" || true)"
   [ "${n}" != "0" ] && ok "守护使用 ${fn}（单一来源 fanlogic.h）" \
                     || bad "守护未使用 ${fn}（逻辑可能又复制了一份）"
@@ -490,6 +490,35 @@ if [ "${DAEMON_UP}" = "1" ] && pgrep -x FanPilot >/dev/null 2>&1; then
                      || bad "只有 ${okn}/3 次跟上守护的最新写入 —— 监听失效或没重挂"
 else
   skip "守护或菜单栏 App 未运行，跳过 R19"
+fi
+
+grp "回归 R20 —— 紧急打满 / 解除被当成「外部改动」⇒ 让步 30 分钟、风扇卡在最高速（2026-10-29 真事故）"
+# 🩸 每次紧急进出，守护都把「SMC 回读 ≠ 新目标」记成外部改动，一进一出凑满 3 次 ⇒ 让步，停在自己写的上限。
+# ⭐ 判据看 external_overrides 的**增量**：每次改配置都会清空抢写计数，只看「有没有让步」测不出这个 bug。
+if [ "${DAEMON_UP}" = "1" ]; then
+  avg="$(stat_num temp_average_c | cut -d. -f1)"
+  if [ "${avg:-0}" -ge 71 ] && [ "${avg:-0}" -lt 85 ]; then
+    e0="$(stat_num external_overrides)"
+    set_key emergency_temp 70; sleep 7
+    m1="$(stat_str mode)"; e1="$(stat_num external_overrides)"
+    set_key emergency_temp 90; sleep 7
+    m_hold="$(stat_str mode)"
+    # 打满后至少保持 60 s 才解除（2.1.3：防过热路径的写入风暴）⇒ 最多再等 75 s
+    for _ in $(seq 15); do [ "$(stat_str mode)" = "normal" ] && break; sleep 5; done
+    m2="$(stat_str mode)"; e2="$(stat_num external_overrides)"
+    [ "${m_hold}" = "emergency" ] && ok "改回阈值 7 s 后仍在打满（最短保持 60 s，不立即解除）" \
+                                  || bad "打满 7 s 就解除了 —— 最短保持时间失效，温度来回摆时会频繁写 SMC"
+    [ "${m1}" = "emergency" ] && ok "阈值 70°C（全核平均 ${avg}°C）⇒ 进入紧急打满" \
+                              || bad "阈值 70°C 时 mode=${m1}，没进入紧急 —— 本条判据前提不成立"
+    [ "${m2}" = "normal" ] && ok "阈值改回 90°C ⇒ 解除，回到定速" || bad "改回 90°C 后 mode=${m2}"
+    [ "$(( e2 - e0 ))" = "0" ] \
+      && ok "⭐紧急进入 + 解除全程「外部改动」+0（自己改目标不算别人改）" \
+      || bad "紧急进出被记成外部改动 $(( e2 - e0 )) 次 —— 3 次就会让步 30 分钟、风扇卡在最高速"
+  else
+    skip "全核平均 ${avg}°C 不在 71~84°C，无法用阈值 70/90 制造一次紧急进出，跳过 R20（单测已覆盖）"
+  fi
+else
+  skip "真守护未运行，跳过 R20"
 fi
 
 grp "回归 R14 —— 测试脚本自己留下孤儿守护（2026-09-14 真事故）"
