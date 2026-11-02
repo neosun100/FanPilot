@@ -254,6 +254,21 @@ static void test_emergency_write_bound(void){
     ok(writes == 0, "⭐设成 100% 时，进出过热 1 小时（360 次）写 SMC 0 次（打满目标 = 定速目标）");
 }
 
+static void test_settle_and_yield_safety(void){
+    group("🔴 唤醒后 SMC 复位不算抢写（2026-11-02 18:58 真机：接管 3 s 后 Tg=0）");
+    ok(fl_counts_as_fight(1003, 1000) == 0, "[回归] 接管后 3 s 的不一致 → 不计入抢写（SMC 自己复位）");
+    ok(fl_counts_as_fight(1019.9, 1000) == 0, "接管后 19.9 s → 仍在稳定期");
+    ok(fl_counts_as_fight(1020, 1000) == 1, "接管后满 20 s → 计入抢写（真有别的程序在写）");
+    // 端到端：每次唤醒 SMC 都复位一次（两个风扇），连续 5 次唤醒，让步次数必须为 0
+    fl_fight g; fl_fight_init(&g); int yields = 0;
+    for (int k = 0; k < 5; k++) {
+        double takeover = k * 120.0;
+        for (int f = 0; f < 2; f++)
+            if (fl_counts_as_fight(takeover + 3, takeover) && fl_fight_note(&g, takeover + 3)) yields++;
+    }
+    ok(yields == 0, "[回归] 10 分钟内唤醒 5 次、每次 SMC 复位两个风扇 ⇒ 让步 0 次（修复前第 2 次唤醒就让步）");
+}
+
 static void test_core_temp_key(void){
     group("fl_is_core_temp_key —— 什么算核心温度（守护与 fanctl 共用）");
     ok(fl_is_core_temp_key("Tp00", "flt ", 4, 65.0), "Tp00 flt 4B 65°C → 是");
@@ -290,6 +305,7 @@ int main(void){
     test_core_temp_key();
     test_self_vs_external();
     test_emergency_write_bound();
+    test_settle_and_yield_safety();
     printf("\n═══════════════════════════════\n  通过 %d · 失败 %d\n", g_pass, g_fail);
     if (g_fail == 0) printf("  ✅ 全部通过\n");
     return g_fail == 0 ? 0 : 1;

@@ -161,7 +161,9 @@ static Key    g_temp[MAX_SENSORS]; static int g_ntemp = 0;   // Tp* 簇
 static Key    g_md[NFAN], g_tg[NFAN], g_ac[NFAN];
 static double g_fmin[NFAN], g_fmax[NFAN];                    // 运行时读到的硬件上下限
 static long   g_writes = 0;
-static double g_last_tg[NFAN] = {-1, -1};   // 我上次写进 F*Tg 的值（-1 = 没写过 / 已交还）—— 判「外部改动」的唯一依据
+static double g_last_tg[NFAN] = {-1, -1};
+static double g_takeover_at = 0;            // 最近一次接管（启动 / 唤醒 / 传感器恢复）的醒着时钟
+static int    g_yield_handed = 0;           // 让步期间已因过热交还过固件   // 我上次写进 F*Tg 的值（-1 = 没写过 / 已交还）—— 判「外部改动」的唯一依据
 static time_t g_last_write = 0;    // 最近一次 SMC 写入的墙钟时间（0 = 从未）—— 让「累计 N 次」可被验证
 static long   g_external = 0;      // 被外部改动并纠正的次数（> 0 说明有别的程序在抢）
 static int    g_emergency = 0;
@@ -307,6 +309,7 @@ static void check_once(void){
         if (pw.caps < 0) logmsg("⚠️ 读不到系统能力（IOPMrootDomain \"System Capabilities\"）—— 无法区分 DarkWake，按完全唤醒接管\n");
         else             logmsg("完全唤醒（系统能力 0x%lx · 盖子%s）→ 重新接管风扇\n", pw.caps, pw.lid_closed == 1 ? "合着（外接屏模式）" : "开着");
         g_sleeping = 0;
+        g_takeover_at = awake_now();
     } else {
         // 🩸 2026-11-02：「通知唤醒」后系统从完全唤醒退回 DarkWake **不发「将睡眠」通知** ⇒ 守护不知道，
         //    合着盖继续按定速控风扇。⇒ 醒着时也每次巡检查一次电源事实，一旦不该接管就立即交还。
@@ -334,7 +337,7 @@ static void check_once(void){
         write_status("failsafe_sensor_read_failed", -1, -1, -1, z, z);
         return;
     }
-    if (g_failsafe) { logmsg( "传感器恢复 → 重新接管\n"); }
+    if (g_failsafe) { logmsg( "传感器恢复 → 重新接管\n"); g_takeover_at = awake_now(); }
     g_failsafe = 0;
 
     int em = fl_emergency_step(&g_cfg, g_emergency,
@@ -349,6 +352,14 @@ static void check_once(void){
 
     double now = awake_now();
     int yielding = fl_fight_yielding(&g_fight, now);
+    // 🔴 让步期间过热：交还固件一次，由固件按温度散热。
+    //    🩸 2026-11-02 排查：让步期间连紧急打满也不执行，风扇可能停在别的程序（或 SMC 复位）留下的低目标上
+    if (yielding && em && !g_yield_handed) {
+        logmsg("🔥 让步期间过热 → 交还固件自动控制（由固件按温度散热，不与对方抢写定速）\n");
+        fans_to_firmware();
+        g_yield_handed = 1;
+    }
+    if (!yielding) g_yield_handed = 0;
     int starved = 0;
     double ac[NFAN], tg[NFAN];
     for (int f = 0; f < NFAN; f++) {
@@ -359,7 +370,11 @@ static void check_once(void){
         if (!yielding && fl_needs_rewrite(md, tg_now, target)) {
             // 回读 ≠ 我上次写的 ⇒ 有别的东西改了寄存器（别的风扇软件 / SMC 复位）。
             // 🩸 不能用「回读 ≠ 新目标」：紧急进出、改档时新目标本来就变了，那是我自己要改（见 fl_is_external_change）
-            if (fl_is_external_change(md, tg_now, g_last_tg[f])) {
+            if (fl_is_external_change(md, tg_now, g_last_tg[f]) && !fl_counts_as_fight(now, g_takeover_at)) {
+                // 接管后的稳定期：唤醒过程中 SMC 会自己复位（2026-11-02 18:58 实测 Tg=0）⇒ 纠正，不计入抢写
+                logmsg("接管后 %.0f s 内 SMC 复位（风扇%d md=%d Tg=%.0f）→ 纠正，不计入抢写\n",
+                       now - g_takeover_at, f, md, tg_now);
+            } else if (fl_is_external_change(md, tg_now, g_last_tg[f])) {
                 g_external++;
                 logmsg( "⚠️ 风扇%d 被外部改动（md=%d Tg=%.0f，累计 %ld 次）\n",
                         f, md, tg_now, g_external);
@@ -655,6 +670,7 @@ int main(int argc, char **argv){
     pm_register();      // 失败已在内部留痕，不阻止启动
 
     fl_bucket_init(&g_bucket, awake_now());
+    g_takeover_at = awake_now();     // 启动也是一次接管：开机初期 SMC 可能还在复位
     fl_fight_init(&g_fight);
     check_once();
     double last = awake_now();

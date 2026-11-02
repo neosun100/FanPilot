@@ -186,6 +186,16 @@ static inline int fl_is_external_change(int md_now, double tg_now, double last_w
     return d > FL_REWRITE_TOLERANCE;
 }
 
+// ── 接管后的稳定期：SMC 自己复位不算抢写 ─────────────────────────
+// 🩸 2026-11-02 18:58 真机：掀盖唤醒，守护 18:58:08 接管，3 s 后回读 Tg=0（md=1）—— 机器上没有别的风扇程序，
+//    是唤醒过程中 SMC 自己复位了一次。被记成 2 次「外部改动」，再多一次就让步 30 分钟，
+//    而让步期间风扇可能停在复位后的低目标上、电脑却在正常干活。
+// ⇒ 接管后 FL_SETTLE_SECONDS 内发现的不一致：照常纠正，但不计入抢写。
+#define FL_SETTLE_SECONDS 20.0
+static inline int fl_counts_as_fight(double now, double takeover_at){
+    return now - takeover_at >= FL_SETTLE_SECONDS;
+}
+
 // ── 哪些 SMC 键算「核心温度」（守护与 fanctl 共用，单一来源）──────────────
 // 🩸 2026-10-28：fanctl 原来手写 5 个键，里面混着 TCMb / TVDP 两个**非核心**键（实测 TVDP 100.48 °C，
 //    比所有核心都热）⇒ fanctl 的「最热」和守护的「最热核心」不是一回事。
