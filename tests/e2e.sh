@@ -153,7 +153,8 @@ grp "回归 R3 —— verify 解析中文输出（BSD awk 非多字节安全）"
 # 真实 bug：`$i=="目标"` 对几乎每个字段返回真 ⇒ 2 个风扇被数成 12 个
 if [ -x "${FANCTL}" ]; then
   kvn="$("${FANCTL}" kv 2>/dev/null | grep -c '^fan[0-9]*_mode=' || true)"
-  [ "${kvn}" = "2" ] && ok "fanctl kv 提供纯 ASCII 机器可读输出（2 个风扇）" \
+  nfk="$("${FANCTL}" kv 2>/dev/null | sed -n 's/^fan_count=//p')"
+  [ "${kvn}" = "${nfk:-x}" ] && ok "fanctl kv 提供纯 ASCII 机器可读输出（${kvn} 个风扇 = fan_count）" \
                      || bad "fanctl kv 输出异常（${kvn} 个风扇）"
   # 剥掉注释后再判：否则会命中「不要解析 fanctl status」这句注释本身
   gz="$(nocomment_sh "${ROOT}/install/verify.sh" | grep -c 'FANCTL}" status' || true)"
@@ -207,7 +208,14 @@ chk_clamp fan1_effective_target "$(printf '%s\n' "$e" | sed -n 's/^fan1_hw_max=/
 grp "回归 R6 —— --check-config 显示模板而非生效值"
 # 真实 bug（1.x）：check-config 在读到硬件范围前就 return ⇒ 看起来能验其实验不到
 hw="$(printf '%s\n' "$e" | grep -c '^fan[01]_hw_max=' || true)"
-[ "${hw}" = "2" ] && ok "check-config 报告两风扇各自的硬件上限" || bad "check-config 未报告硬件上限"
+nfc="$(printf '%s\n' "$e" | sed -n 's/^fan_count=//p')"
+[ "${hw}" = "$(( nfc < 2 ? nfc : 2 ))" ] && ok "check-config 报告每个风扇各自的硬件上限（fan_count=${nfc}）" || bad "check-config 未报告硬件上限"
+# 🩸 2026-11-02：风扇数改为运行时取 FNum ⇒ 用 --max-fans 1 模拟单风扇机型，必须只报 1 个风扇且能给出生效目标
+e1="$("${BIN}" --config "${EVIL}" --check-config --max-fans 1 2>/dev/null)"
+[ "$(printf '%s\n' "$e1" | sed -n 's/^fan_count=//p')" = "1" ] && [ "$(printf '%s\n' "$e1" | grep -c '^fan1_')" = "0" ] \
+  && [ "$(printf '%s\n' "$e1" | grep -c '^fan0_effective_target=')" = "1" ] \
+  && ok "⭐模拟单风扇机型（--max-fans 1）：只处理风扇 0，能给出生效目标（原来写死 2 个，单风扇 Mac 直接拒绝启动）" \
+  || bad "单风扇机型处理异常：$(printf '%s' "$e1" | grep -E '^fan_count|^fan1_' | tr '\n' ' ')"
 l0="$(printf '%s\n' "$e" | sed -n 's/^fan0_effective_target=//p')"
 l1="$(printf '%s\n' "$e" | sed -n 's/^fan1_effective_target=//p')"
 [ -n "${l0}" ] && [ -n "${l1}" ] && [ "${l0}" != "${l1}" ] \

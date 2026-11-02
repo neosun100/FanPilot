@@ -87,10 +87,11 @@ if [ -x "${FANCTL}" ]; then
   #    macOS 自带 BSD awk 不是多字节安全的，2 个风扇曾被数成 12 个。
   kv="$("${FANCTL}" kv 2>/dev/null)"
   md_manual="$(printf '%s\n' "${kv}" | grep -c '^fan[0-9]*_mode=1' || true)"
-  [ "${md_manual}" = "2" ] && ok "两个风扇均为手动模式（守护在控）" \
-                           || bad "手动模式的风扇数 = ${md_manual}" "期望 2"
+  nf="$(printf '%s\n' "${kv}" | sed -n 's/^fan_count=//p')"   # 风扇数随机器而定，不写死 2
+  [ "${md_manual}" = "${nf:-x}" ] && ok "全部 ${nf} 个风扇均为手动模式（守护在控）" \
+                           || bad "手动模式的风扇数 = ${md_manual}" "期望 ${nf}"
   # SMC 里的目标 == 守护报告的目标（判**硬件事实**，不判守护自己说的）
-  for f in 0 1; do
+  for f in $(seq 0 $(( ${nf:-1} - 1 ))); do
     want="$(awk -v f="${f}" -F'[:,]' '/"id": /{id=$2+0} /"target_rpm"/{for(i=1;i<=NF;i++) if($i ~ /"target_rpm"/) {v=$(i+1)+0}; if(id==f){print v; exit}}' "${STATUS}")"
     got="$(printf '%s\n' "${kv}" | sed -n "s/^fan${f}_target=//p")"
     awk -v a="${got:-0}" -v b="${want:-0}" 'BEGIN{exit !(a-b<2 && b-a<2 && b>0)}' \
@@ -149,9 +150,11 @@ if [ -x "${FANCTL}" ]; then
   "${FANCTL}" rpm 0 100 >/dev/null 2>&1
   chk "$([ $? = 2 ] && echo 0 || echo 1)" "低于下限转速被拒绝" "值域校验失效"
 fi
-# S1 键白名单：源码里必须只有那 4 个键
-wl="$(grep -c '"F0md","F1md","F0Tg","F1Tg"' "$(dirname "$0")/../src/fanpilotd.c" || true)"
-[ "${wl}" != "0" ] && ok "守护源码键白名单仅 4 个键" || bad "白名单被改动" "S1 可能失效"
+# S1 键白名单：只放行本机风扇的 F<n>md / F<n>Tg（随风扇数生成，单测 test_fan_count 覆盖判定本身）
+# 白名单随风扇数生成（2.1.6）：写入入口必须经过 fl_is_writable_fan_key，且它只放行 F<n>md / F<n>Tg（n < 风扇数）
+wl="$(sed -E 's|^[[:space:]]*//.*$||' "$(dirname "$0")/../src/fanpilotd.c" | grep -c 'return fl_is_writable_fan_key(k, g_nfan)' || true)"
+[ "${wl}" = "1" ] && ok "守护的写入白名单经过 fl_is_writable_fan_key（只放行 F<n>md / F<n>Tg，n < 本机风扇数）" \
+                  || bad "写入白名单没有经过 fl_is_writable_fan_key" "S1 可能失效"
 # 单实例锁：再起一个必须被拒（退出码 4）
 "${BIN}" --config "${CONF}" --status /tmp/verify-dup.json >/dev/null 2>&1
 chk "$([ $? = 4 ] && echo 0 || echo 1)" "第二个实例被拒绝启动" "单实例锁失效"
