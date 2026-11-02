@@ -201,9 +201,22 @@ static inline int fl_is_core_temp_key(const char *name, const char *type4, unsig
 // ⇒ 只在系统能力含**显示**位（完全唤醒，盖子开着 / 用户在用）时接管；DarkWake 只有 CPU/网络位。
 //    caps < 0 = 读不到：按「接管」处理（否则将来接口变了，FanPilot 会在每次唤醒后静默失效），调用方必须留痕。
 #define FL_CAP_GRAPHICS 0x02          // = IOPM.h 的 kIOPMSystemCapabilityGraphics
-static inline int fl_should_take_over(long caps){
-    if (caps < 0) return 1;
-    return (caps & FL_CAP_GRAPHICS) != 0;
+// 电源事实（都从 IOPMrootDomain 读；-1 = 读不到）
+typedef struct {
+    long caps;        // "System Capabilities"
+    int  lid_closed;  // "AppleClamshellState"：盖子合着
+    int  lid_sleeps;  // "AppleClamshellCausesSleep"：合盖会让机器睡（没接外接屏 + 电源时为 Yes）
+} fl_power;
+
+// 🩸 2026-11-02 真机日志：合着盖插上 USB-C ⇒ 系统做一次 4 s 的「通知唤醒」（能力 = 15，**盖子仍合着**），
+//    守护判为完全唤醒并接管；随后系统退回 DarkWake **不发「将睡眠」通知** ⇒ 合着盖风扇转了约 30 s，直到掀盖。
+// ⇒ 接管要两条都成立：① 能力含显示位 ② 不是「盖子合着且合盖就该睡」。
+//    外接屏 + 电源的合盖模式 lid_sleeps = No ⇒ 机器在工作，照常接管。
+//    caps 读不到 ⇒ 按接管处理（不静默失效，调用方留痕）；盖子状态读不到 ⇒ 不据此拦截。
+static inline int fl_should_take_over(const fl_power *p){
+    if (p->lid_closed == 1 && p->lid_sleeps == 1) return 0;
+    if (p->caps < 0) return 1;
+    return (p->caps & FL_CAP_GRAPHICS) != 0;
 }
 
 // ── 写入令牌桶 ────────────────────────────────────────────────────

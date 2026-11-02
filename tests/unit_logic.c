@@ -266,12 +266,17 @@ static void test_core_temp_key(void){
 
 static void test_darkwake(void){
     group("🔴 合盖：DarkWake 不接管，完全唤醒才接管");
-    ok(fl_should_take_over(15) == 1, "完全唤醒（CPU|显示|音频|网络 = 15）→ 接管");
-    ok(fl_should_take_over(0x0B) == 1, "有显示位即接管（0x0B）");
-    ok(fl_should_take_over(0x09) == 0, "⭐DarkWake（CPU|网络 = 0x09，无显示位）→ 不接管，风扇继续归固件");
-    ok(fl_should_take_over(0x01) == 0, "只有 CPU → 不接管");
-    ok(fl_should_take_over(0) == 0, "能力为 0（睡眠中）→ 不接管");
-    ok(fl_should_take_over(-1) == 1, "读不到能力 → 接管（宁可接管也不静默失效；调用方留痕）");
+    #define P(c,l,s) (&(fl_power){ (c), (l), (s) })
+    ok(fl_should_take_over(P(15, 0, 1)) == 1, "完全唤醒、盖子开着 → 接管");
+    ok(fl_should_take_over(P(0x0B, 0, 1)) == 1, "有显示位即接管（0x0B）");
+    ok(fl_should_take_over(P(0x09, 0, 1)) == 0, "⭐DarkWake（CPU|网络 = 0x09，无显示位）→ 不接管，风扇继续归固件");
+    ok(fl_should_take_over(P(0x01, 0, 1)) == 0, "只有 CPU → 不接管");
+    ok(fl_should_take_over(P(0, 0, 1)) == 0, "能力为 0（睡眠中）→ 不接管");
+    ok(fl_should_take_over(P(-1, -1, -1)) == 1, "什么都读不到 → 接管（宁可接管也不静默失效；调用方留痕）");
+    ok(fl_should_take_over(P(15, 1, 1)) == 0, "[回归] 合着盖的「通知唤醒」（能力 15）→ 不接管（2026-11-02 合着盖转了 30 s）");
+    ok(fl_should_take_over(P(15, 1, 0)) == 1, "外接屏 + 电源的合盖模式（合盖不睡）→ 机器在工作，接管");
+    ok(fl_should_take_over(P(15, -1, -1)) == 1, "盖子状态读不到 → 不据此拦截");
+    ok(fl_should_take_over(P(-1, 1, 1)) == 0, "能力读不到但盖子合着且会睡 → 不接管");
 }
 
 int main(void){
