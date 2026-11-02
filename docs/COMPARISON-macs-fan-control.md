@@ -5,7 +5,7 @@
 > **❔ 未验证** = 没测过，**不下结论**（MFC 闭源，很多项只能是这一档）。
 >
 > 对照环境：MacBook Pro M5 Max（Mac17,6）· macOS 26.6.2 (25G83) ·
-> Macs Fan Control **1.5.21**（测于 2026-09-20）· FanPilot **2.0.0**（测于 2026-10-28）。
+> Macs Fan Control **1.5.21**（测于 2026-09-20）· FanPilot **2.1.5**（资源数字测于 2.1.0，2026-10-28）。
 >
 > 🔴 **更正（2026-10-28）**：本文初版对照的是 FanPilot 1.3.0，第一条结论写的是「要随温度自动调速 ⇒ 选 FanPilot」。
 > **2.0 已删除自适应曲线**，FanPilot 现在同样是定速 —— 那条结论不再成立，已改为下面的「过热保护」。
@@ -29,9 +29,9 @@
 
 ## 1. 逐项对照
 
-| # | 维度 | FanPilot 2.0.0 | Macs Fan Control 1.5.21 | 证据 |
+| # | 维度 | FanPilot 2.1.5 | Macs Fan Control 1.5.21 | 证据 |
 |---|---|---|---|---|
-| 1 | **睡眠交还固件** | ✅ 注册 `IORegisterForSystemPower`，`kIOMessageSystemWillSleep` 时写 `F*md=0`；睡眠中的 DarkWake（无显示能力）**不接管**，只在完全唤醒时重新接管（2.1.1） | 🔴 **无**。主二进制、特权 helper、全部 Qt 框架**均未导入任何电源管理符号**，只导入 `IOServiceOpen` + `IOConnectCallStructMethod` | 📄 `dyld_info -imports`（方法已过正对照，见 §4）|
+| 1 | **睡眠交还固件** | ✅ 注册 `IORegisterForSystemPower`，`kIOMessageSystemWillSleep` 时写 `F*md=0`；睡眠中的 DarkWake（无显示能力）与合着盖的通知唤醒**都不接管**，只在完全唤醒且盖子开着（或外接屏合盖模式）时重新接管；2026-11-02 两次真机合盖已核对 | 🔴 **无**。主二进制、特权 helper、全部 Qt 框架**均未导入任何电源管理符号**，只导入 `IOServiceOpen` + `IOConnectCallStructMethod` | 📄 `dyld_info -imports`（方法已过正对照，见 §4）|
 | 2 | **命令行控制** | ✅ `fanctl` + 配置文件 | 🔴 **完全没有**：包内无 CLI 二进制 · 无 `.sdef`（不支持 AppleScript）· `Info.plist` 无 `CFBundleURLTypes` · 主程序 `strings` 无任何 `--xxx`/`usage:` | 📄 四路核实 |
 | 3 | **配置真源** | ✅ **配置文件**。守护监视配置目录，改完**即刻生效**（原地编辑 ≤ 10 s），不用重启、不用提权 | ⚠️ **进程内存才是真源**。偏好里只是快照（`ActivePreset` = base64 的 `UNSAVED\|1,3200\|1,3200`），必须**重启 App** 才读；且它退出时会**回写覆盖**你的外部修改 | 🔬 base64 解码 + 与 SMC `F*Tg` 交叉验证一致 |
 | 4 | **CPU（稳态）** | **0.017%**（1.3.0：0.100%） | **0.30 ~ 0.35%** | 🔬 双方都是 `powermetrics --samplers tasks` 实测（FanPilot 2026-10-28 120 s 窗口；MFC 2026-09-20 两窗口） |
