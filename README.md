@@ -13,8 +13,8 @@
   <a href="https://github.com/neosun100/FanPilot/releases/latest"><img alt="release" src="https://img.shields.io/github/v/release/neosun100/FanPilot?style=flat-square&color=0F4C75"/></a>
   <img alt="platform" src="https://img.shields.io/badge/macOS-13%2B%20·%20Apple%20Silicon-0F4C75?style=flat-square&logo=apple&logoColor=white"/>
   <img alt="lang" src="https://img.shields.io/badge/C%20%2B%20Swift-零依赖-3AAFA9?style=flat-square"/>
-  <img alt="tests" src="https://img.shields.io/badge/tests-205%20passing-3AAFA9?style=flat-square"/>
-  <img alt="mutations" src="https://img.shields.io/badge/mutations-15%2F15%20killed-3AAFA9?style=flat-square"/>
+  <img alt="tests" src="https://img.shields.io/badge/tests-212%20passing-3AAFA9?style=flat-square"/>
+  <img alt="mutations" src="https://img.shields.io/badge/mutations-16%2F16%20killed-3AAFA9?style=flat-square"/>
   <img alt="smc writes" src="https://img.shields.io/badge/稳态写%20SMC-0%20次-2E7D32?style=flat-square"/>
   <a href="LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square"/></a>
 </p>
@@ -328,6 +328,8 @@ SMC 的 `F*md=1`（手动）与 `F*Tg`（目标）是**锁存**寄存器 —— 
 | 重载只认配置身份 | 目录事件只在配置文件 inode/size/mtime 变化时才重载 | 往配置目录造 100 次无关事件 ⇒ 重载 0 次（开发中曾实测 23 秒 4074 次） |
 | 重启节流 | launchd `ThrottleInterval = 10` | 启动持续失败时不会每秒重扫 3669 个 SMC 键（1.x 是每秒一次） |
 | 单实例 | 守护 `flock`；App 后来者自动退出 | 再起一个实例 ⇒ 被拒 / 自动退出 |
+| 唤醒后的稳定期 | 接管后 20 s 内 SMC 自己复位：纠正但不计入抢写 | 10 分钟内唤醒 5 次、每次复位 ⇒ 让步 0 次 |
+| 让步期间过热 | 交还固件一次，由固件按温度散热 | （代码保证；无法在真机同时制造让步与过热） |
 
 ### 失效安全
 
@@ -384,14 +386,14 @@ grep writes_total /var/run/fanpilot.status.json; sleep 60; grep writes_total /va
 ## 测试
 
 ```bash
-make test     # 单元 90 + 验收 31 + E2E/回归 84 = 205 项
+make test     # 单元 94 + 验收 31 + E2E/回归 87 = 212 项
 ```
 
 | 层 | 守什么 | 守不住什么 |
 |---|---|---|
-| `tests/unit_logic.c` · **90** | `fanlogic.h` 全部纯逻辑：配置解析（含 NaN / 垃圾值 / 注释）、硬夹、百分比折算、紧急回差、令牌桶、抢写让步 | IOKit 交互 |
+| `tests/unit_logic.c` · **94** | `fanlogic.h` 全部纯逻辑：配置解析（含 NaN / 垃圾值 / 注释）、硬夹、百分比折算、紧急回差、令牌桶、抢写让步 | IOKit 交互 |
 | `install/verify.sh` · **31** | 装好后的事实：运行状态、失效安全、**稳态 60 秒 0 写入**、资源预算、重启节流、反向断言 | 用户路径 |
-| `tests/e2e.sh` · **84** | 真机用户路径 + 按真实 bug 编号的回归，含活体：改档即刻生效、目录噪音不触发重载、原地编辑 ≤ 1 周期生效、被抢写时让步、App 单实例 | 真实合盖（见路线图） |
+| `tests/e2e.sh` · **87** | 真机用户路径 + 按真实 bug 编号的回归，含活体：改档即刻生效、目录噪音不触发重载、原地编辑 ≤ 1 周期生效、被抢写时让步、App 单实例 | 真实合盖（见路线图） |
 
 关键判据都做过**变异验证**：把修过的缺陷改回去（容差 50、桶容量 16、去掉回差、永远重写、去 NaN 防护、紧急不打满、让步失效、不剥注释），
 测试必须变红 —— **8/8 变红**；另有 2 条接线级变异：去掉「重挂文件监听」⇒ R19 红，DarkWake 改回「无条件接管」⇒ `--selftest-pm` fail。
