@@ -321,8 +321,14 @@ if [ -x "${DBIN}" ]; then
   [ "${a0}" = "0" ] && [ "${a1}" = "0" ] && ok "WillSleep 后两风扇 F*md 真变 0（已交还固件）" \
                                          || bad "WillSleep 后 F*md 仍是 ${a0}/${a1}"
   [ "$(kv darkwake_stays_firmware)" = "1" ] \
-    && ok "⭐DarkWake（能力 0x09，无显示）收到「已唤醒」后风扇仍归固件（md=$(kv darkwake_fan0_md)/$(kv darkwake_fan1_md)）" \
+    && ok "⭐DarkWake（能力 0x09，无显示）收到「已唤醒」后风扇仍归固件" \
     || bad "DarkWake 时风扇被接管 —— 合盖放包里会每小时冲一次定速（本机约每小时一次 DarkWake）"
+  [ "$(kv lid_notification_wake_stays_firmware)" = "1" ] \
+    && ok "⭐合着盖的通知唤醒（能力 15，盖子合着且会睡）后风扇仍归固件（2026-11-02 真机：合着盖转了 30 s）" \
+    || bad "合着盖的通知唤醒被当成完全唤醒 —— 插充电线时合着盖风扇会转"
+  [ -n "$(kv lid_closed)" ] && [ "$(kv lid_closed)" != "-1" ] \
+    && ok "读得到盖子状态（AppleClamshellState = $(kv lid_closed) · CausesSleep = $(kv lid_sleeps)）" \
+    || bad "读不到盖子状态 —— 无法识别合着盖的通知唤醒"
   [ -n "$(kv system_caps)" ] && [ "$(kv system_caps)" != "-1" ] \
     && ok "读得到系统能力（System Capabilities = $(kv system_caps)）—— 能区分 DarkWake" \
     || bad "读不到系统能力 —— 无法区分 DarkWake，会按完全唤醒接管"
@@ -341,6 +347,10 @@ if [ -x "${DBIN}" ]; then
   # 🩸 2.0 新增：WillSleep 之后、真睡着之前的几秒内，巡检不得把 md 写回 1
   [ "$(cnt_c 'if (g_sleeping)')" != "0" ] && ok "睡前窗口内巡检不重新接管（g_sleeping 闸门）" \
                                           || bad "缺 g_sleeping 闸门 —— 交还后可能又被巡检写回手动"
+  # 2026-11-02：交还期间状态文件不更新 ⇒ 合着盖被 Caffeinated 保持唤醒时菜单栏显示「陈旧」，像守护卡死
+  [ "$(cnt_c 'write_status("sleeping_firmware_auto"')" -ge 3 ] \
+    && ok "交还期间每次巡检照常刷新状态文件（不会被误显示为陈旧）" \
+    || bad "交还期间不刷新状态文件 —— 菜单栏会显示「陈旧」"
 else
   skip "守护未构建，跳过 R12"
 fi
