@@ -5,7 +5,7 @@
 <h1 align="center">FanPilot</h1>
 
 <p align="center">
-  <b>把 Mac 的两个风扇定在一个百分比；一旦过热（全核平均 ≥ 90 °C）立即打满，降温后自动回到你的设定。</b><br/>
+  <b>把 Mac 的风扇定在一个百分比；一旦过热（全核平均 ≥ 90 °C）立即打满，降温后自动回到你的设定。</b><br/>
   守护进程 5.9 MB 内存 · 0.03 % CPU · 稳态写 SMC <b>0</b> 次 —— 温度每 5 秒更新，守护 + 菜单栏合计仍低于 Macs Fan Control。
 </p>
 
@@ -13,8 +13,8 @@
   <a href="https://github.com/neosun100/FanPilot/releases/latest"><img alt="release" src="https://img.shields.io/github/v/release/neosun100/FanPilot?style=flat-square&color=0F4C75"/></a>
   <img alt="platform" src="https://img.shields.io/badge/macOS-13%2B%20·%20Apple%20Silicon-0F4C75?style=flat-square&logo=apple&logoColor=white"/>
   <img alt="lang" src="https://img.shields.io/badge/C%20%2B%20Swift-零依赖-3AAFA9?style=flat-square"/>
-  <img alt="tests" src="https://img.shields.io/badge/tests-212%20passing-3AAFA9?style=flat-square"/>
-  <img alt="mutations" src="https://img.shields.io/badge/mutations-16%2F16%20killed-3AAFA9?style=flat-square"/>
+  <img alt="tests" src="https://img.shields.io/badge/tests-227%20passing-3AAFA9?style=flat-square"/>
+  <img alt="mutations" src="https://img.shields.io/badge/mutations-18%2F18%20killed-3AAFA9?style=flat-square"/>
   <img alt="smc writes" src="https://img.shields.io/badge/稳态写%20SMC-0%20次-2E7D32?style=flat-square"/>
   <a href="LICENSE"><img alt="license" src="https://img.shields.io/badge/license-MIT-blue?style=flat-square"/></a>
 </p>
@@ -65,7 +65,7 @@
 写 SMC：启动以来共 4 次  ·  最近一次 16 秒前
 ───
 固定转速        85%
-  两个风扇按各自硬件上限的百分比 · 选完即刻生效
+  每个风扇按各自硬件上限的百分比 · 选完即刻生效
   ───
   30%   ·  1605 / 1733 RPM   ·  最静
   40%   ·  2140 / 2311 RPM   ·  安静
@@ -243,6 +243,10 @@ rm -rf /Applications/FanPilot.app
 
 **`bootstrap` 报 `5: Input/output error`？** 服务被 `launchctl disable` 过（持久开关）。`install.sh` 会自动检测并重新 enable。
 
+**换一台 Mac，菜单里的转速会变吗？** 会，而且是自动的。每一档 = 百分比 × **这台机器每个风扇自己的硬件上限**，
+上下限和风扇个数都是守护启动时从 SMC 读的，代码里没有写死任何机型的数值。
+（2.1.6 之前风扇个数写死为 2，单风扇的 Mac 守护会拒绝启动 —— 已修，用 `--max-fans 1` 在真机演练过。）
+
 **温度比别的 App 高约 10 °C？** 它们把多个键（含偏凉的传感器）混合平滑后显示；FanPilot 显示的是最热核心的原始值。
 解码已逐字节核验并与第三方实现交叉验证，见 [`docs/SMC-RESEARCH.md` §3.1](docs/SMC-RESEARCH.md)。
 
@@ -254,7 +258,7 @@ rm -rf /Applications/FanPilot.app
 
 | | |
 |---|---|
-| 芯片 | Apple Silicon（风扇数取自 `FNum`、上下限取自 `F*Mn`/`F*Mx`，不硬编码） |
+| 芯片 | Apple Silicon，1~4 个风扇（风扇数运行时取自 `FNum`、上下限取自 `F*Mn`/`F*Mx`，不硬编码；没有风扇的机型守护空闲待命） |
 | 系统 | macOS 13+ · SIP 启用即可 |
 | 实测机型 | **只在 MacBook Pro M5 Max（Mac17,6）/ macOS 26.6–26.7 上验证过** |
 | 互斥 | 不能与 Macs Fan Control / TG Pro / smcFanControl 等同时运行 |
@@ -393,17 +397,17 @@ grep writes_total /var/run/fanpilot.status.json; sleep 60; grep writes_total /va
 ## 测试
 
 ```bash
-make test     # 单元 94 + 验收 31 + E2E/回归 87 = 212 项
+make test     # 单元 108 + 验收 31 + E2E/回归 88 = 227 项
 ```
 
 | 层 | 守什么 | 守不住什么 |
 |---|---|---|
-| `tests/unit_logic.c` · **94** | `fanlogic.h` 全部纯逻辑：配置解析（含 NaN / 垃圾值 / 注释）、硬夹、百分比折算、紧急回差、令牌桶、抢写让步 | IOKit 交互 |
+| `tests/unit_logic.c` · **108** | `fanlogic.h` 全部纯逻辑：配置解析（含 NaN / 垃圾值 / 注释）、硬夹、百分比折算、紧急回差、令牌桶、抢写让步 | IOKit 交互 |
 | `install/verify.sh` · **31** | 装好后的事实：运行状态、失效安全、**稳态 60 秒 0 写入**、资源预算、重启节流、反向断言 | 用户路径 |
-| `tests/e2e.sh` · **87** | 真机用户路径 + 按真实 bug 编号的回归，含活体：改档即刻生效、目录噪音不触发重载、原地编辑 ≤ 1 周期生效、被抢写时让步、App 单实例、紧急进出不误判（R20）、唤醒稳定期（R21） | 真实合盖（只能靠日志事后核对，见路线图） |
+| `tests/e2e.sh` · **88** | 真机用户路径 + 按真实 bug 编号的回归，含活体：改档即刻生效、目录噪音不触发重载、原地编辑 ≤ 1 周期生效、被抢写时让步、App 单实例、紧急进出不误判（R20）、唤醒稳定期（R21） | 真实合盖（只能靠日志事后核对，见路线图） |
 
-关键判据都做过**变异验证**（把修过的缺陷改回去，测试必须变红）—— **16/16 变红**：
-单测 12 条（容差 50、桶容量 16、去回差、永远重写、去 NaN 防护、紧急不打满、让步失效、不剥注释、外部改动判据 ×2、保持时间 0、去盖子条件）；
+关键判据都做过**变异验证**（把修过的缺陷改回去，测试必须变红）—— **18/18 变红**：
+单测 14 条（容差 50、桶容量 16、去回差、永远重写、去 NaN 防护、紧急不打满、让步失效、不剥注释、外部改动判据 ×2、保持时间 0、去盖子条件、风扇数固定为 2、白名单不看风扇数）；
 接线 / 真机 4 条（去掉重挂文件监听 ⇒ R19 红；DarkWake 改回无条件接管 ⇒ `--selftest-pm` fail；去盖子条件 ⇒ 自检 fail；稳定期改 0 ⇒ R21 真机 +1）。
 
 **反向断言和正向断言一样重要**：越界百分比必须被夹、第二个实例必须启动失败、恶意配置的安全阈值必须被夹住、
