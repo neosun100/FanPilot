@@ -531,6 +531,27 @@ else
   skip "真守护未运行，跳过 R20"
 fi
 
+grp "回归 R21 —— 唤醒 / 启动后 SMC 自己复位被算成抢写（2026-11-02 18:58 真机：接管 3 s 后 Tg=0）"
+# 重启守护 = 一次接管；3 s 内改目标 = 模拟 SMC 复位 ⇒ 必须纠正、但不计入抢写；25 s 后再改 ⇒ 必须计入
+if [ "${DAEMON_UP}" = "1" ]; then
+  launchctl kickstart -k system/com.newmac.fanpilotd >/dev/null 2>&1
+  for _ in $(seq 30); do [ "$(stat_str mode)" = "normal" ] && [ "$(stat_num writes_total)" -ge 1 ] 2>/dev/null && break; sleep 0.5; done
+  e0="$(stat_num external_overrides)"
+  "${FANCTL}" rpm 0 2222 >/dev/null 2>&1
+  sleep 7
+  e1="$(stat_num external_overrides)"
+  [ "$(fan_target 0)" != "2222" ] && ok "接管后 3 s 内的改动被纠正（目标 $(fan_target 0)）" || bad "接管后的改动没被纠正"
+  [ "${e1}" = "${e0}" ] && ok "⭐接管后稳定期内的改动不计入抢写（外部改动 ${e0} → ${e1}）" \
+                        || bad "稳定期内的改动被计入抢写（${e0} → ${e1}）—— 唤醒时 SMC 复位两次就会让步"
+  sleep 16
+  "${FANCTL}" rpm 0 2222 >/dev/null 2>&1; sleep 7
+  e2="$(stat_num external_overrides)"
+  [ "${e2}" -gt "${e1}" ] && ok "⭐反向：稳定期之后的改动照常计入（${e1} → ${e2}）—— 检测没被削弱" \
+                          || bad "稳定期之后的改动没计入 —— 抢写检测失效"
+else
+  skip "真守护未运行，跳过 R21"
+fi
+
 grp "回归 R14 —— 测试脚本自己留下孤儿守护（2026-09-14 真事故）"
 # 事故：R4 裸启动一个 fanpilotd（真守护当时已停 ⇒ flock 无人占 ⇒ 它成了真守护并阻塞）；
 #      我 pkill 掉 e2e.sh 后它被孤儿化（PPID=1），在后台写了 6 小时 SMC，
