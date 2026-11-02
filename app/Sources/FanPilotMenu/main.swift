@@ -363,14 +363,16 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let avgRPM = s.fans.map(\.actual_rpm).reduce(0, +) / Double(max(s.fans.count, 1))
         // 菜单栏温度 = **最高核心**（使用者 2026-10-28 指定：最关注整颗 CPU 最热的那一处）。
         // 紧急判据用哪个口径另由配置 emergency_source 决定，菜单里标在对应那一行旁边。
-        let temp = String(format: "%.0f°C", sticky(s.temp_hottest_c, &shownTemp, band: 1.0, step: 1))
+        // 交还 / 失效安全时守护写 -1（没读或读不到温度）⇒ 显示 --，不显示「-1°C」
+        let temp = s.temp_hottest_c < 0 ? "--°C"
+                 : String(format: "%.0f°C", sticky(s.temp_hottest_c, &shownTemp, band: 1.0, step: 1))
         // 取整到 10 RPM：实际转速每次采样都抖 ±10（4540 / 4556 …），不取整的话「内容不变不重绘」
         // 几乎从不生效，5s 巡检下菜单栏每 5 秒重画一次（2026-10-28 实测 App CPU 0.026% → 0.17%）。
         // 下拉菜单里仍显示每个风扇的精确实际转速。
         let rpm  = String(format: "%.0f", sticky(avgRPM, &shownRPM, band: 20, step: 10))
         if !s.isFresh {
             setTitle(temp, "陈旧", .stale)        // 陈旧就说出来，绝不静默展示旧值
-        } else if s.mode.hasPrefix("failsafe") || s.mode.hasPrefix("stopped") {
+        } else if s.mode.hasPrefix("failsafe") || s.mode.hasPrefix("stopped") || s.mode.hasPrefix("sleeping") {
             setTitle(temp, "固件", .firmware)
         } else if s.fans.contains(where: fanLooksFaulty) {
             setTitle(temp, rpm, .fault)
@@ -527,6 +529,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                      et, et - 5))
         case "failsafe_sensor_read_failed": set("⚠️ 读不到温度 —— 已交还固件自动控制")
         case "stopped_firmware_auto":       set("守护已停止 —— 风扇由固件自动控制")
+        case "sleeping_firmware_auto":      set("合着盖 / 睡眠中 —— 风扇交给固件，掀盖后自动接管")
         case "yielded_external_writer":     set("🛑 有别的程序在改风扇 —— FanPilot 暂时让步 30 分钟（改一次档可立即接管）")
         case "write_budget_exhausted":      set("🛑 SMC 写入过于频繁 —— 已暂停写入，几分钟后自动恢复")
         default:          set("⚠️ \(s.mode)")
