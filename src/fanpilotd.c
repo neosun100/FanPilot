@@ -51,7 +51,6 @@
 #define CMD_READ_KEYINFO 9
 
 #define MAX_SENSORS 64
-#define NFAN        FL_NFAN
 
 typedef struct { uint8_t a,b,c,d; uint16_t r; } SVer;
 typedef struct { uint16_t v,l; uint32_t a,b,c; } SPLim;
@@ -87,12 +86,11 @@ static void k2s(uint32_t k, char *o){
     o[0]=(k>>24)&255; o[1]=(k>>16)&255; o[2]=(k>>8)&255; o[3]=k&255; o[4]=0;
 }
 
-// S1 键白名单：唯一允许写入的 4 个键
-static int is_writable_key(const char *k){
-    static const char *W[] = {"F0md","F1md","F0Tg","F1Tg",NULL};
-    for (int i=0; W[i]; i++) if (!strcmp(k, W[i])) return 1;
-    return 0;
-}
+static int g_nfan = 0;              // 本机风扇数：启动时读 SMC 的 FNum（fl_fan_count 夹到 1~4）
+static int g_max_fans = FL_MAX_FANS; // --max-fans N：仅测试用，模拟风扇更少的机型
+
+// S1 键白名单：只有 F<n>md / F<n>Tg（n < 本机风扇数）可写 —— 随机器生成，不写死
+static int is_writable_key(const char *k){ return fl_is_writable_fan_key(k, g_nfan); }
 
 static int smc_open(void){
     io_service_t svc = IOServiceGetMatchingService(
@@ -158,12 +156,12 @@ static int key_write_u8(const Key *k, uint8_t v){ return key_write(k,&v,1); }
 // ───────────────────────── 运行时状态 ─────────────────────────
 
 static Key    g_temp[MAX_SENSORS]; static int g_ntemp = 0;   // Tp* 簇
-static Key    g_md[NFAN], g_tg[NFAN], g_ac[NFAN];
-static double g_fmin[NFAN], g_fmax[NFAN];                    // 运行时读到的硬件上下限
+static Key    g_md[FL_MAX_FANS], g_tg[FL_MAX_FANS], g_ac[FL_MAX_FANS];
+static double g_fmin[FL_MAX_FANS], g_fmax[FL_MAX_FANS];      // 运行时读到的硬件上下限
 static long   g_writes = 0;
-static double g_last_tg[NFAN] = {-1, -1};
+static double g_last_tg[FL_MAX_FANS];      // 我上次写进 F*Tg 的值（-1 = 没写过 / 已交还）—— 判「外部改动」的唯一依据
 static double g_takeover_at = 0;            // 最近一次接管（启动 / 唤醒 / 传感器恢复）的醒着时钟
-static int    g_yield_handed = 0;           // 让步期间已因过热交还过固件   // 我上次写进 F*Tg 的值（-1 = 没写过 / 已交还）—— 判「外部改动」的唯一依据
+static int    g_yield_handed = 0;           // 让步期间已因过热交还过固件
 static time_t g_last_write = 0;    // 最近一次 SMC 写入的墙钟时间（0 = 从未）—— 让「累计 N 次」可被验证
 static long   g_external = 0;      // 被外部改动并纠正的次数（> 0 说明有别的程序在抢）
 static int    g_emergency = 0;
@@ -225,7 +223,7 @@ static int read_temps(double *hottest, double *average, double *coolest){
 // 交还写入也计入 writes_total —— 菜单里的「启动以来共写 N 次」若漏掉睡眠/退出时的交还，数字就偏小
 // （不受令牌桶限制：这是安全方向的写入，且只在边沿发生）
 static void fans_to_firmware(void){
-    for (int f = 0; f < NFAN; f++) {
+    for (int f = 0; f < g_nfan; f++) {
         g_last_tg[f] = -1;          // 交还后回读 md=0 是预期，不得算成外部改动
         // 已经是固件控制就不写：DarkWake 结束重新睡眠时也会走到这里，每次白写 2 次（约每小时一次）
         int md = -1;
@@ -277,11 +275,11 @@ static void write_status(const char *mode, double hot, double avg, double cool,
       (long)time(NULL), mode, hot, avg, cool, g_ntemp, g_writes, (long)g_last_write, g_external,
       g_cfg.percent, g_cfg.check_interval, g_cfg.emergency_temp, fl_src_name(g_cfg.emergency_source));
     // set_rpm = 定速折算值（不含紧急）；target_rpm = 此刻实际下发的目标（紧急时为上限）
-    for (int f = 0; f < NFAN; f++)
+    for (int f = 0; f < g_nfan; f++)
         fprintf(fp, "    {\"id\": %d, \"set_rpm\": %.0f, \"target_rpm\": %.0f,"
                     " \"actual_rpm\": %.0f, \"min\": %.0f, \"max\": %.0f}%s\n",
                 f, fl_fan_target(&g_cfg, g_fmin[f], g_fmax[f], 0), tg[f], ac[f],
-                g_fmin[f], g_fmax[f], f==NFAN-1?"":",");
+                g_fmin[f], g_fmax[f], f==g_nfan-1?"":",");
     fprintf(fp, "  ]\n}\n");
     fclose(fp);
     rename(tmp, g_status_path);           // 原子替换，读者永远看不到半个文件
@@ -293,7 +291,7 @@ static void write_status(const char *mode, double hot, double avg, double cool,
 // 它是幂等的：回读一致就什么都不写。
 // 不再区分「为什么来巡检」：是不是外部改动只看回读与我上次写的值（fl_is_external_change），与场景无关
 static void check_once(void){
-    double z[NFAN] = {0, 0};
+    double z[FL_MAX_FANS] = {0};
     if (g_sleeping) {
         // 🩸 两个事实都成立才接管：
         //  ① 确实醒过（收到过唤醒通知）；或通知丢了但醒着已超 30 s —— 时长只当「去查」的触发器。
@@ -361,8 +359,8 @@ static void check_once(void){
     }
     if (!yielding) g_yield_handed = 0;
     int starved = 0;
-    double ac[NFAN], tg[NFAN];
-    for (int f = 0; f < NFAN; f++) {
+    double ac[FL_MAX_FANS], tg[FL_MAX_FANS];
+    for (int f = 0; f < g_nfan; f++) {
         double target = fl_fan_target(&g_cfg, g_fmin[f], g_fmax[f], em);
         int md = -1; double tg_now = -1;
         if (key_read_u8(&g_md[f], &md) != 0) md = -1;
@@ -416,7 +414,7 @@ static void log_effective(void){
     logmsg( "生效配置: 定速 %.1f%% · 巡检 %.0fs · 紧急 %.0f°C（%s，回差 %.0f°C）\n",
             g_cfg.percent, g_cfg.check_interval, g_cfg.emergency_temp,
             fl_src_name(g_cfg.emergency_source), FL_EMERG_HYSTERESIS);
-    for (int f = 0; f < NFAN; f++)
+    for (int f = 0; f < g_nfan; f++)
         logmsg( "  风扇%d → %.0f RPM（硬件 %.0f~%.0f）\n", f,
                 fl_fan_target(&g_cfg, g_fmin[f], g_fmax[f], 0), g_fmin[f], g_fmax[f]);
 }
@@ -541,8 +539,15 @@ static int watch_config_dir(void){
 
 // ───────────────────────── 启动 ─────────────────────────
 
+// 返回 0 成功 · -1 键不全 / 读不到 FNum · 2 本机没有风扇
 static int init_fan_keys(int need_write){
-    for (int f = 0; f < NFAN; f++) {
+    Key kn; int fnum = -1;
+    if (key_init(&kn, "FNum") != 0 || key_read_u8(&kn, &fnum) != 0) fnum = -1;
+    g_nfan = fl_fan_count(fnum < g_max_fans ? fnum : g_max_fans);
+    if (fnum < 0) { logmsg("✗ 读不到风扇数（SMC FNum）—— 拒绝控制\n"); return -1; }
+    if (g_nfan == 0) return 2;
+    for (int f = 0; f < g_nfan; f++) {
+        g_last_tg[f] = -1;
         char n[8]; Key mn, mx;
         snprintf(n,8,"F%dmd",f); key_init(&g_md[f], n);
         snprintf(n,8,"F%dTg",f); key_init(&g_tg[f], n);
@@ -569,6 +574,7 @@ int main(int argc, char **argv){
         else if (!strcmp(argv[i], "--oneshot")) oneshot = 1;
         else if (!strcmp(argv[i], "--check-config")) check_only = 1;
         else if (!strcmp(argv[i], "--selftest-pm")) selftest_pm = 1;
+        else if (!strcmp(argv[i], "--max-fans") && i+1 < argc) g_max_fans = atoi(argv[++i]);   // 测试用
     }
     fl_cfg_load(g_cfg_path, &g_cfg);
 
@@ -581,12 +587,12 @@ int main(int argc, char **argv){
         printf("smc_open=1\n");
         init_fan_keys(0);
         int okall = 1;
-        for (int f = 0; f < NFAN; f++) {
+        for (int f = 0; f < g_nfan; f++) {
             int b; if (key_read_u8(&g_md[f], &b) != 0) b = -1;
             printf("fan%d_md_before=%d\n", f, b);
         }
         pm_apply(kIOMessageSystemWillSleep);          // ← 被测的那一条路径
-        for (int f = 0; f < NFAN; f++) {
+        for (int f = 0; f < g_nfan; f++) {
             int a; if (key_read_u8(&g_md[f], &a) != 0) a = -1;
             printf("fan%d_md_after=%d\n", f, a);
             if (a != 0) okall = 0;
@@ -607,7 +613,7 @@ int main(int argc, char **argv){
             g_power_fake = cases[c];
             pm_apply(kIOMessageSystemHasPoweredOn);
             int ok1 = g_sleeping == 1;
-            for (int f = 0; f < NFAN; f++) {
+            for (int f = 0; f < g_nfan; f++) {
                 int m; if (key_read_u8(&g_md[f], &m) != 0) m = -1;
                 if (m != 0) ok1 = 0;
             }
@@ -626,11 +632,12 @@ int main(int argc, char **argv){
     //    🩸 1.x 初版打印的是模板而非生效值 —— 看起来能验、其实验不到
     if (check_only) {
         if (smc_open() == 0) init_fan_keys(0);
-        else for (int f = 0; f < NFAN; f++) g_fmin[f] = g_fmax[f] = -1;
+        else for (int f = 0; f < g_nfan; f++) g_fmin[f] = g_fmax[f] = -1;
         printf("percent=%.1f\n", g_cfg.percent);
+        printf("fan_count=%d\n", g_nfan);
         printf("check_interval=%.1f\nemergency_temp=%.1f\nemergency_source=%s\n",
                g_cfg.check_interval, g_cfg.emergency_temp, fl_src_name(g_cfg.emergency_source));
-        for (int f = 0; f < NFAN; f++) {
+        for (int f = 0; f < g_nfan; f++) {
             printf("fan%d_hw_min=%.0f\nfan%d_hw_max=%.0f\n", f, g_fmin[f], f, g_fmax[f]);
             if (g_fmax[f] > 0)
                 printf("fan%d_effective_target=%.0f\n", f,
@@ -657,11 +664,22 @@ int main(int argc, char **argv){
     }
 
     if (smc_open() != 0) { logmsg( "✗ 打不开 SMC\n"); return 1; }
-    if (init_fan_keys(1) != 0) return 1;
+    int fk = init_fan_keys(1);
+    if (fk == 2) {
+        // 没有风扇（如 MacBook Air）：说明原因后**空等**而不是退出 ——
+        // 退出的话 KeepAlive 会每 10 s 拉起一次、每次都去读 SMC，等于又一个「自己不断重来」
+        logmsg("本机没有风扇（SMC FNum=0）—— 无需控制，守护空闲待命（不读写 SMC）\n");
+        for (;;) pause();
+    }
+    if (fk != 0) return 1;
     if (enum_sensors() != 0) { logmsg( "✗ 找不到 Tp* 传感器\n"); return 1; }
 
-    logmsg( "fanpilotd 2 启动: %d 个传感器 · 风扇0 %.0f~%.0f · 风扇1 %.0f~%.0f\n",
-            g_ntemp, g_fmin[0], g_fmax[0], g_fmin[1], g_fmax[1]);
+    {
+        char fans[256] = ""; size_t o = 0;
+        for (int f = 0; f < g_nfan && o < sizeof fans; f++)
+            o += (size_t)snprintf(fans + o, sizeof fans - o, " · 风扇%d %.0f~%.0f", f, g_fmin[f], g_fmax[f]);
+        logmsg("fanpilotd 2 启动: %d 个传感器 · %d 个风扇%s\n", g_ntemp, g_nfan, fans);
+    }
     log_effective();
 
     watch_signal(SIGTERM); watch_signal(SIGINT); watch_signal(SIGHUP);
@@ -716,7 +734,7 @@ int main(int argc, char **argv){
     // 正常退出 / SIGTERM：交还固件（SIGKILL 走不到这里，靠 launchd KeepAlive）
     logmsg( "退出 → 交还固件自动控制\n");
     fans_to_firmware();
-    double z[NFAN] = {0, 0};
+    double z[FL_MAX_FANS] = {0};
     write_status("stopped_firmware_auto", -1, -1, -1, z, z);
     IOServiceClose(g_conn);
     return 0;

@@ -269,6 +269,24 @@ static void test_settle_and_yield_safety(void){
     ok(yields == 0, "[回归] 10 分钟内唤醒 5 次、每次 SMC 复位两个风扇 ⇒ 让步 0 次（修复前第 2 次唤醒就让步）");
 }
 
+static void test_fan_count(void){
+    group("风扇数随机器而定（不再写死 2 个）");
+    ok(fl_fan_count(1) == 1, "[回归] FNum=1 → 控制 1 个风扇（原来直接拒绝启动）");
+    ok(fl_fan_count(2) == 2, "FNum=2 → 2 个");
+    ok(fl_fan_count(3) == 3, "FNum=3 → 3 个（原来只控制前两个）");
+    ok(fl_fan_count(9) == FL_MAX_FANS, "FNum=9 → 上限 4");
+    ok(fl_fan_count(0) == 0, "FNum=0（无风扇，如 MacBook Air）→ 0");
+    ok(fl_fan_count(-1) == 0, "读不到 → 0（调用方拒绝控制）");
+    ok(fl_is_writable_fan_key("F0md", 1) && fl_is_writable_fan_key("F0Tg", 1), "1 个风扇：F0md / F0Tg 可写");
+    ok(!fl_is_writable_fan_key("F1Tg", 1), "⭐1 个风扇：F1Tg 不可写（白名单随风扇数收紧）");
+    ok(fl_is_writable_fan_key("F2Tg", 3), "3 个风扇：F2Tg 可写");
+    ok(!fl_is_writable_fan_key("F0Mx", 2), "F0Mx（上限）永远不可写");
+    ok(!fl_is_writable_fan_key("F0Ac", 2), "F0Ac（实际转速）永远不可写");
+    ok(!fl_is_writable_fan_key("Tp00", 2), "温度键不可写");
+    ok(!fl_is_writable_fan_key("F0mdX", 2), "长度不对 → 不可写");
+    ok(!fl_is_writable_fan_key("F0", 2) && !fl_is_writable_fan_key("", 2), "过短的字符串 → 不可写（不越界读）");
+}
+
 static void test_core_temp_key(void){
     group("fl_is_core_temp_key —— 什么算核心温度（守护与 fanctl 共用）");
     ok(fl_is_core_temp_key("Tp00", "flt ", 4, 65.0), "Tp00 flt 4B 65°C → 是");
@@ -306,6 +324,7 @@ int main(void){
     test_self_vs_external();
     test_emergency_write_bound();
     test_settle_and_yield_safety();
+    test_fan_count();
     printf("\n═══════════════════════════════\n  通过 %d · 失败 %d\n", g_pass, g_fail);
     if (g_fail == 0) printf("  ✅ 全部通过\n");
     return g_fail == 0 ? 0 : 1;

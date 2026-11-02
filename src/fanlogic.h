@@ -16,7 +16,21 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define FL_NFAN 2
+// 风扇数**运行时**取自 SMC 的 FNum（1~4）。数组按上限分配，循环按实际个数。
+// 🩸 2026-11-02 使用者问「转速会不会随 Mac 不同而变」时核查发现：这里原来写死 FL_NFAN = 2，
+//    且守护要求两个风扇的键都在 ⇒ 1 个风扇的 Mac（部分 MacBook Pro 14"、Mac mini）守护直接拒绝启动；
+//    3 个以上只控制前两个。README 写的「风扇数取自 FNum」对守护并不成立。
+#define FL_MAX_FANS 4
+static inline int fl_fan_count(int fnum){
+    if (fnum <= 0) return 0;
+    return fnum > FL_MAX_FANS ? FL_MAX_FANS : fnum;
+}
+// 唯一允许写入的键：F<n>md / F<n>Tg，且 n < 实际风扇数（白名单随机器生成，不再写死 4 个）
+static inline int fl_is_writable_fan_key(const char *k, int nfan){
+    if (!k || strlen(k) != 4 || k[0] != 'F' || k[1] < '0' || k[1] > '9') return 0;
+    if (k[1] - '0' >= nfan) return 0;
+    return (k[2] == 'm' && k[3] == 'd') || (k[2] == 'T' && k[3] == 'g');
+}
 
 // ── 所有阈值集中在这里（不散落成魔法数字）──────────────────────────
 #define FL_DEFAULT_PCT          50.0  // 默认定速：各风扇硬件上限的 50%
