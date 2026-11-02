@@ -442,7 +442,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // ⭐ 唯一需要用户调的东西：定速档。入口右侧显示当前值（不用点开就知道）。
         let root = NSMenuItem(title: "固定转速", action: nil, keyEquivalent: "")
         let sub = NSMenu()
-        let note = NSMenuItem(title: "两个风扇按各自硬件上限的百分比 · 选完即刻生效", action: nil, keyEquivalent: "")
+        let note = NSMenuItem(title: "每个风扇按各自硬件上限的百分比 · 选完即刻生效", action: nil, keyEquivalent: "")
         note.isEnabled = false
         sub.addItem(note)
         sub.addItem(.separator())
